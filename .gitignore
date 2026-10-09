@@ -1,0 +1,4 @@
+/ntfy-admin
+/bin/
+*.test
+*.out

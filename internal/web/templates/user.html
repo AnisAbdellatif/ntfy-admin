@@ -1,0 +1,91 @@
+{{define "content"}}
+{{$u := .Data.User}}
+<p class="crumbs"><a href="{{url "/users"}}">Users</a> /</p>
+<div class="page-head">
+  <h1>{{display $u.Username}} <span class="badge badge-{{$u.Role}}">{{$u.Role}}</span>{{if .Data.IsSvc}} <span class="badge">service</span>{{end}}</h1>
+</div>
+{{if $u.Tier}}<p>Tier: <code>{{$u.Tier}}</code></p>{{end}}
+
+{{if not .Data.Editable}}
+  <p class="note">Admin users have full access and are managed in <code>server.yml</code> (<code>auth-users</code>) or with the ntfy CLI. They are read-only here.</p>
+{{else}}
+  {{if $u.IsAnonymous}}<p class="note">These rules apply to everyone, including clients without credentials. Users without a matching rule of their own fall back to these and to <code>auth-default-access</code>.</p>{{end}}
+  {{if .Data.IsSvc}}<p>This is a service account. <a href="{{svcPath $u.Username}}">Manage its tokens →</a></p>{{end}}
+  {{template "configNote"}}
+{{end}}
+
+<h2>Access rules</h2>
+{{if .Data.Rules}}
+<table class="data">
+  <thead><tr><th>Topic / pattern</th><th>Permission</th>{{if .Data.Editable}}<th class="actions">Actions</th>{{end}}</tr></thead>
+  <tbody>
+  {{- range .Data.Rules}}
+    <tr>
+      <td><code>{{.Topic}}</code>{{if isPattern .Topic}} <span class="badge badge-pattern">pattern</span>{{end}}</td>
+      <td>{{template "perm" .Permission}}</td>
+      {{- if $.Data.Editable}}
+      <td class="actions">
+        <form method="post" action="{{userPath $u.Username}}/access/revoke" class="inline-form" data-confirm="Revoke {{.Permission}} on “{{.Topic}}” for {{display $u.Username}}?">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="topic" value="{{.Topic}}">
+          <button type="submit" class="btn-small btn-danger">Revoke</button>
+        </form>
+      </td>
+      {{- end}}
+    </tr>
+  {{- end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No rules.</p>
+{{end}}
+
+{{if .Data.Editable}}
+<section class="card">
+  <h3>Add or change a rule</h3>
+  <form method="post" action="{{userPath $u.Username}}/access" class="row">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Topic or pattern <input name="topic" required pattern="[\-_*A-Za-z0-9]{1,64}" maxlength="64" placeholder="alerts or backup_*"></label>
+    <label>Permission <select name="permission">{{template "permOptions" .Permissions}}</select></label>
+    <button type="submit" class="btn-primary">Save rule</button>
+  </form>
+</section>
+
+{{if .Data.Rules}}
+<section class="card danger-zone">
+  <h3>Revoke all rules</h3>
+  <p>Removes every rule of {{display $u.Username}} at once and drops affected open subscriptions. Type <code>{{$u.Username}}</code> to confirm.</p>
+  <form method="post" action="{{userPath $u.Username}}/access/reset" class="row">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input name="confirm" required autocomplete="off" aria-label="Type the username to confirm">
+    <button type="submit" class="btn-danger">Revoke all rules</button>
+  </form>
+</section>
+{{end}}
+
+{{if and (eq $u.Role "user") (not .Data.IsSvc)}}
+<section class="card">
+  <h3>Change password</h3>
+  <p class="hint">Existing tokens of this user stay valid after a password change.</p>
+  <form method="post" action="{{userPath $u.Username}}/password" class="row">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <span class="with-button">
+      <input name="password" type="password" required autocomplete="new-password" id="user-pw" aria-label="New password">
+      <button type="button" class="btn-small" data-genpw="#user-pw">Generate</button>
+    </span>
+    <button type="submit" class="btn-primary">Change password</button>
+  </form>
+</section>
+{{end}}
+
+{{if eq $u.Role "user"}}
+<section class="card danger-zone">
+  <h3>Delete user</h3>
+  <form method="post" action="{{userPath $u.Username}}/delete" data-confirm="Delete user “{{$u.Username}}”? This cuts their access immediately, including open subscriptions.">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit" class="btn-danger">Delete {{$u.Username}}</button>
+  </form>
+</section>
+{{end}}
+{{end}}
+{{end}}

@@ -1,0 +1,11 @@
+# ntfy config for the ntfy-admin integration test. Do not use in production.
+base-url: "http://localhost:18080"
+listen-http: ":80"
+auth-file: "/tmp/user.db"
+auth-default-access: "deny-all"
+# admin / adminpass (hash created with `ntfy user hash`)
+auth-users:
+  - "admin:$2a$10$7W38O7oUR9SAh9RXnm75qebQHxhqYRKPMRiIOkgS62YyEI0hQ73Oy:admin"
+# The test sends many requests in a short time from one address.
+visitor-request-limit-burst: 1000
+visitor-request-limit-replenish: "10ms"

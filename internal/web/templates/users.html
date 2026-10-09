@@ -1,0 +1,64 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Users</h1>
+  <input type="search" placeholder="Filter…" data-filter="#users-table" aria-label="Filter users">
+</div>
+
+<details class="card add" {{if not .Data.Users}}open{{end}}>
+  <summary>Add user</summary>
+  <form method="post" action="{{url "/users"}}" class="stack">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label>Username <input name="username" required pattern="[\-_.+@a-zA-Z0-9]+" autocomplete="off"></label>
+      <label>Password
+        <span class="with-button">
+          <input name="password" type="password" required autocomplete="new-password" id="new-user-pw">
+          <button type="button" class="btn-small" data-genpw="#new-user-pw">Generate</button>
+        </span>
+      </label>
+    </div>
+    {{template "ruleRows" .}}
+    <p class="hint">For scripts and devices, create a <a href="{{url "/service-accounts"}}">service account</a> instead.</p>
+    <button type="submit" class="btn-primary">Create user</button>
+  </form>
+</details>
+
+<table id="users-table" class="data">
+  <thead><tr><th>Username</th><th>Role</th><th>Tier</th><th>Rules</th><th class="actions">Actions</th></tr></thead>
+  <tbody>
+  {{- range .Data.Users}}
+    <tr>
+      <td><a href="{{userPath .Username}}">{{display .Username}}</a>{{if .IsSvc}} <span class="badge">service</span>{{end}}</td>
+      <td><span class="badge badge-{{.Role}}">{{.Role}}</span></td>
+      <td>{{or .Tier "–"}}</td>
+      <td>{{.Rules}}</td>
+      <td class="actions">
+      {{- if .IsAdmin}}
+        <span class="muted">managed in server.yml / CLI</span>
+      {{- else if .IsAnonymous}}
+        <a href="{{userPath .Username}}">Edit rules</a>
+      {{- else}}
+        {{- if not .IsSvc}}
+        <details class="inline">
+          <summary>Change password</summary>
+          <form method="post" action="{{userPath .Username}}/password" class="inline-form">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="back" value="users">
+            <input name="password" type="password" required autocomplete="new-password" aria-label="New password for {{.Username}}">
+            <button type="submit" class="btn-small">Save</button>
+          </form>
+        </details>
+        {{- else}}
+        <a href="{{svcPath .Username}}">Tokens</a>
+        {{- end}}
+        <form method="post" action="{{userPath .Username}}/delete" class="inline-form" data-confirm="Delete user “{{.Username}}”? This cuts their access immediately, including open subscriptions.">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit" class="btn-small btn-danger">Delete</button>
+        </form>
+      {{- end}}
+      </td>
+    </tr>
+  {{- end}}
+  </tbody>
+</table>
+{{end}}

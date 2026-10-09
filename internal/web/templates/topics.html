@@ -1,0 +1,105 @@
+{{define "content"}}
+{{$d := .Data}}
+<div class="page-head">
+  <h1>Topics</h1>
+  <nav class="tabs">
+    <a href="{{url "/topics"}}"{{if not $d.Matrix}} aria-current="page"{{end}}>List</a>
+    <a href="{{url "/topics?view=matrix"}}"{{if $d.Matrix}} aria-current="page"{{end}}>Matrix</a>
+  </nav>
+</div>
+<p class="note">This view is derived from access rules only; ntfy has no API to list topics that exist or are active.</p>
+{{template "configNote"}}
+
+<details class="card add">
+  <summary>Add a rule</summary>
+  <form method="post" action="{{url "/topics/grant"}}" class="row">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Topic or pattern <input name="topic" required pattern="[\-_*A-Za-z0-9]{1,64}" maxlength="64" placeholder="alerts or backup_*"></label>
+    <label>User <select name="username">{{range $d.Grantable}}<option value="{{.}}">{{display .}}</option>{{end}}</select></label>
+    <label>Permission <select name="permission">{{template "permOptions" .Permissions}}</select></label>
+    <button type="submit" class="btn-primary">Save rule</button>
+  </form>
+</details>
+
+{{if $d.Matrix}}
+  {{if $d.Truncated}}<p class="note">Showing the first 50 users and 50 topics only.</p>{{end}}
+  {{if $d.Columns}}
+  <div class="matrix-wrap">
+  <table class="data matrix">
+    <thead><tr><th>User</th>{{range $d.Columns}}<th><a href="#t-{{.}}" class="col">{{.}}</a></th>{{end}}</tr></thead>
+    <tbody>
+    {{- range $d.Rows}}
+      <tr><th><a href="{{userPath .Username}}">{{display .Username}}</a></th>
+      {{- range .Cells}}<td>{{if .}}<span class="perm perm-{{.}}" title="{{.}}">{{.}}</span>{{end}}</td>{{end}}</tr>
+    {{- end}}
+    </tbody>
+  </table>
+  </div>
+  {{else}}<p class="muted">No rules yet.</p>{{end}}
+{{else}}
+  {{if $d.Topics}}
+  <input type="search" placeholder="Filter topics…" data-filter="#topic-list" data-filter-items=".topic" aria-label="Filter topics">
+  <div id="topic-list">
+  {{- range $d.Topics}}
+  {{$t := .}}
+  <section class="card topic" id="t-{{.Topic}}">
+    <div class="topic-head">
+      <h2><code>{{.Topic}}</code>{{if .IsPattern}} <span class="badge badge-pattern">pattern</span>{{end}}</h2>
+      <div class="topic-actions">
+        {{if eq .Public "read-only"}}<span class="badge badge-public">public read-only</span>{{else if .Public}}<span class="badge badge-public">anonymous: {{.Public}}</span>{{end}}
+        {{if ne .Public "read-only"}}
+        <form method="post" action="{{url "/topics/public"}}" class="inline-form" data-confirm="Allow everyone (anonymous) to read “{{.Topic}}”?">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="topic" value="{{.Topic}}">
+          <button type="submit" class="btn-small">Make public read-only</button>
+        </form>
+        {{end}}
+        {{if .Public}}
+        <form method="post" action="{{url "/topics/private"}}" class="inline-form" data-confirm="Remove the anonymous rule on “{{.Topic}}”?">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="topic" value="{{.Topic}}">
+          <button type="submit" class="btn-small">Make private</button>
+        </form>
+        {{end}}
+      </div>
+    </div>
+    {{if .MatchedBy}}<p class="hint">Also matched by: {{range $i, $p := .MatchedBy}}{{if $i}}, {{end}}<a href="#t-{{$p}}"><code>{{$p}}</code></a>{{end}}</p>{{end}}
+    <table class="data">
+      <thead><tr><th>User</th><th>Permission</th><th class="actions">Actions</th></tr></thead>
+      <tbody>
+      {{- range .Entries}}
+        <tr>
+          <td><a href="{{userPath .Username}}">{{display .Username}}</a>{{if .IsSvc}} <span class="badge">service</span>{{end}}</td>
+          <td>
+            <form method="post" action="{{url "/topics/grant"}}" class="inline-form">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="topic" value="{{$t.Topic}}">
+              <input type="hidden" name="username" value="{{.Username}}">
+              {{$cur := .Permission}}
+              <select name="permission" aria-label="Permission for {{.Username}}">{{range $.Permissions}}<option value="{{.}}"{{if eq . $cur}} selected{{end}}>{{.}}</option>{{end}}</select>
+              <button type="submit" class="btn-small">Change</button>
+            </form>
+          </td>
+          <td class="actions">
+            <form method="post" action="{{url "/topics/revoke"}}" class="inline-form" data-confirm="Revoke {{.Permission}} on “{{$t.Topic}}” for {{display .Username}}?">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="topic" value="{{$t.Topic}}">
+              <input type="hidden" name="username" value="{{.Username}}">
+              <button type="submit" class="btn-small btn-danger">Revoke</button>
+            </form>
+          </td>
+        </tr>
+      {{- end}}
+      </tbody>
+    </table>
+    <form method="post" action="{{url "/topics/grant"}}" class="row add-entry">
+      <input type="hidden" name="csrf" value="{{$.CSRF}}">
+      <input type="hidden" name="topic" value="{{.Topic}}">
+      <select name="username" aria-label="User">{{range $d.Grantable}}<option value="{{.}}">{{display .}}</option>{{end}}</select>
+      <select name="permission" aria-label="Permission">{{template "permOptions" $.Permissions}}</select>
+      <button type="submit" class="btn-small">Add user to topic</button>
+    </form>
+  </section>
+  {{- end}}
+  </div>
+  {{else}}<p class="muted">No rules yet. Add one above, or from a user's page.</p>{{end}}
+{{end}}
+{{end}}

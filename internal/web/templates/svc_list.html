@@ -1,0 +1,42 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Service accounts</h1>
+</div>
+<p class="note">A service account is a regular ntfy user whose name starts with <code>{{.SvcPrefix}}</code>, used only through tokens. ntfy tokens carry the full access of their user, so give each script or device its own account with narrow rules.</p>
+
+<details class="card add" {{if not .Data.Accounts}}open{{end}}>
+  <summary>Create service account</summary>
+  <form method="post" action="{{url "/service-accounts"}}" class="stack">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <label>Name
+        <span class="prefixed"><span class="prefix">{{.SvcPrefix}}</span><input name="name" required pattern="[\-_.+@a-zA-Z0-9]+" autocomplete="off" placeholder="backup-server"></span>
+      </label>
+    </div>
+    {{template "ruleRows" .}}
+    <div class="row">
+      <label>Token label <input name="label" maxlength="128" placeholder="e.g. nas backup script"></label>
+      {{template "expiryInputs"}}
+    </div>
+    <button type="submit" class="btn-primary">Create and issue token</button>
+  </form>
+</details>
+
+{{if .Data.Accounts}}
+<input type="search" placeholder="Filter…" data-filter="#svc-table" aria-label="Filter service accounts">
+<table id="svc-table" class="data">
+  <thead><tr><th>Name</th><th>Rules</th><th class="actions">Actions</th></tr></thead>
+  <tbody>
+  {{- range .Data.Accounts}}
+    <tr>
+      <td><a href="{{svcPath .Username}}">{{.Username}}</a></td>
+      <td>{{range .Rules}}<span class="rule"><code>{{.Topic}}</code> {{template "perm" .Permission}}</span> {{else}}<span class="muted">none (disabled)</span>{{end}}</td>
+      <td class="actions"><a href="{{svcPath .Username}}">Tokens</a> · <a href="{{userPath .Username}}">Rules</a></td>
+    </tr>
+  {{- end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No service accounts yet.</p>
+{{end}}
+{{end}}

@@ -1,0 +1,34 @@
+{{define "permOptions"}}{{range .}}<option value="{{.}}">{{.}}</option>{{end}}{{end}}
+
+{{define "ruleRows"}}
+<fieldset class="rules" data-rules>
+  <legend>Access rules</legend>
+  <p class="hint">Topic or pattern (<code>*</code> wildcard, e.g. <code>backup_*</code>). Leave empty to skip.</p>
+  <div class="rule-rows">
+    <div class="rule-row">
+      <input name="topic" placeholder="topic or pattern" pattern="[\-_*A-Za-z0-9]{1,64}" maxlength="64" aria-label="Topic">
+      <select name="permission" aria-label="Permission">{{template "permOptions" .Permissions}}</select>
+    </div>
+  </div>
+  <button type="button" class="btn-small" data-add-rule>+ Add rule</button>
+</fieldset>
+{{end}}
+
+{{define "expiryInputs"}}
+<label>Expiry
+  <select name="expiry" data-expiry>
+    <option value="never">Never</option>
+    <option value="30d">30 days</option>
+    <option value="90d" selected>90 days</option>
+    <option value="1y">1 year</option>
+    <option value="custom">Custom date…</option>
+  </select>
+</label>
+<label class="expiry-date">Expires on (UTC) <input type="date" name="expiry_date"></label>
+{{end}}
+
+{{define "configNote"}}
+<p class="note">Rules and users defined in <code>server.yml</code> (<code>auth-users</code>, <code>auth-access</code>, <code>auth-tokens</code>) are re-applied by ntfy at startup; changes to them here may be reverted on the next restart.</p>
+{{end}}
+
+{{define "perm"}}<span class="perm perm-{{.}}">{{.}}</span>{{end}}

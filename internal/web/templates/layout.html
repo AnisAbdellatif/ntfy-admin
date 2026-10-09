@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{.Title}} · ntfy-admin</title>
+<link rel="stylesheet" href="{{url "/static/style.css"}}">
+<script src="{{url "/static/app.js"}}" defer></script>
+</head>
+<body>
+{{- if .User}}
+<header class="top">
+  <a class="brand" href="{{url "/users"}}">ntfy-admin</a>
+  <nav>
+    <a href="{{url "/users"}}"{{if or (eq .Page "users") (eq .Page "user")}} aria-current="page"{{end}}>Users</a>
+    <a href="{{url "/topics"}}"{{if eq .Page "topics"}} aria-current="page"{{end}}>Topics</a>
+    <a href="{{url "/service-accounts"}}"{{if or (eq .Page "svc_list") (eq .Page "svc")}} aria-current="page"{{end}}>Service accounts</a>
+  </nav>
+  <form method="post" action="{{url "/logout"}}" class="logout">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <span class="whoami">{{.User}}</span>
+    <button type="submit" class="btn-small">Log out</button>
+  </form>
+</header>
+{{- end}}
+<main>
+{{- range .Flashes}}
+  <div class="flash flash-{{.Kind}}" role="status">{{.Message}}</div>
+{{- end}}
+{{template "content" .}}
+</main>
+</body>
+</html>

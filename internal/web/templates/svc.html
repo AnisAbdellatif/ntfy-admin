@@ -1,0 +1,89 @@
+{{define "content"}}
+{{$a := .Data.Account}}
+<p class="crumbs"><a href="{{url "/service-accounts"}}">Service accounts</a> /</p>
+<div class="page-head"><h1>{{$a.Username}} <span class="badge">service</span></h1></div>
+
+{{with .Data.Reveal}}
+<section class="card reveal" role="alert">
+  <h2>New token</h2>
+  <p><strong>Copy it now.</strong> It is shown only once and cannot be retrieved later.</p>
+  <div class="secret"><code id="new-token">{{.Token}}</code> <button type="button" class="btn-small" data-copy="#new-token">Copy</button></div>
+  <p class="hint">Label: {{or .Label "–"}} · Expires: {{unix .Expires}}</p>
+  <h3>Examples</h3>
+  {{with $.Data.Example}}
+  {{if .CanWrite}}
+  <pre id="ex-pub">curl -H "Authorization: Bearer {{$.Data.Reveal.Token}}" -d "Backup finished" {{$.Data.NtfyURL}}/{{.Topic}}</pre>
+  <button type="button" class="btn-small" data-copy="#ex-pub">Copy publish example</button>
+  {{end}}
+  {{if .CanRead}}
+  <pre id="ex-sub">curl -s -H "Authorization: Bearer {{$.Data.Reveal.Token}}" {{$.Data.NtfyURL}}/{{.Topic}}/json</pre>
+  <button type="button" class="btn-small" data-copy="#ex-sub">Copy subscribe example</button>
+  {{end}}
+  {{end}}
+</section>
+{{end}}
+
+<h2>Access rules</h2>
+{{if .Data.Rules}}
+<ul class="rules-list">{{range .Data.Rules}}<li><code>{{.Topic}}</code> {{template "perm" .Permission}}</li>{{end}}</ul>
+{{else}}
+<p class="muted">No rules: this account only gets <code>auth-default-access</code>.</p>
+{{end}}
+<p><a href="{{userPath $a.Username}}">Edit rules →</a></p>
+
+<h2>Tokens</h2>
+{{with .Data.TokenError}}<div class="flash flash-error">{{.}}</div>{{end}}
+{{if .Data.Tokens}}
+<table class="data">
+  <thead><tr><th>Token</th><th>Label</th><th>Expires</th><th>Last used</th><th class="actions">Actions</th></tr></thead>
+  <tbody>
+  {{- range .Data.Tokens}}
+    <tr{{if .Expired}} class="expired"{{end}}>
+      <td><code>{{.Masked}}</code></td>
+      <td>{{or .Label "–"}}</td>
+      <td>{{unix .Expires}}{{if .Expired}} <span class="badge">expired</span>{{end}}</td>
+      <td>{{if .LastAccess}}{{unix .LastAccess}}{{if .LastOrigin}} from {{.LastOrigin}}{{end}}{{else}}–{{end}}</td>
+      <td class="actions">
+        {{if .Provisioned}}<span class="muted">from server.yml</span>{{else}}
+        <form method="post" action="{{svcPath $a.Username}}/tokens/revoke" class="inline-form" data-confirm="Revoke token {{.Masked}}{{if .Label}} ({{.Label}}){{end}}? Clients using it lose access immediately.">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="idx" value="{{.Index}}">
+          <input type="hidden" name="masked" value="{{.Masked}}">
+          <button type="submit" class="btn-small btn-danger">Revoke</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+  {{- end}}
+  </tbody>
+</table>
+{{else if not .Data.TokenError}}
+<p class="muted">No tokens.</p>
+{{end}}
+
+<section class="card">
+  <h3>Issue a new token</h3>
+  <form method="post" action="{{svcPath $a.Username}}/tokens" class="row">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Label <input name="label" maxlength="128" placeholder="e.g. nas backup script"></label>
+    {{template "expiryInputs"}}
+    <button type="submit" class="btn-primary">Issue token</button>
+  </form>
+  <p class="hint">ntfy keeps at most 60 tokens per user and silently removes the oldest beyond that.</p>
+</section>
+
+<section class="card danger-zone">
+  <h3>Offboarding</h3>
+  <p>Both actions cut access immediately, including open subscriptions.</p>
+  <div class="row">
+    <form method="post" action="{{svcPath $a.Username}}/disable" class="inline-form" data-confirm="Disable “{{$a.Username}}”? All its rules will be revoked.">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="btn-danger"{{if not .Data.Rules}} disabled{{end}}>Disable (revoke all rules)</button>
+    </form>
+    <form method="post" action="{{svcPath $a.Username}}/delete" class="inline-form" data-confirm="Delete service account “{{$a.Username}}” and all its tokens?">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="btn-danger">Delete account</button>
+    </form>
+  </div>
+</section>
+{{end}}

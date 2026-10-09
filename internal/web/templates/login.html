@@ -1,0 +1,14 @@
+{{define "content"}}
+<section class="login card">
+  <h1>ntfy-admin</h1>
+  <p class="muted">Log in with an ntfy <strong>admin</strong> account.</p>
+  {{with .Data.Notice}}<div class="flash flash-ok" role="status">{{.}}</div>{{end}}
+  {{with .Data.Error}}<div class="flash flash-error" role="alert">{{.}}</div>{{end}}
+  <form method="post" action="{{url "/login"}}">
+    <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
+    <label>Username <input name="username" value="{{.Data.Username}}" autocomplete="username" required autofocus></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit" class="btn-primary">Log in</button>
+  </form>
+</section>
+{{end}}

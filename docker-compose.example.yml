@@ -1,0 +1,29 @@
+# ntfy-admin next to an existing ntfy container. ntfy-admin needs no volumes,
+# only network access to ntfy. Put it behind your HTTPS reverse proxy and do
+# not expose it to the internet unless you have to.
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2.29.0
+    command: serve
+    restart: unless-stopped
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - ./ntfy/data:/var/lib/ntfy
+    ports:
+      - "8090:80"
+
+  ntfy-admin:
+    image: ghcr.io/anisabdellatif/ntfy-admin:latest   # or `build: .` to build from source
+    restart: unless-stopped
+    depends_on:
+      - ntfy
+    environment:
+      NTFY_URL: "http://ntfy:80"                      # internal URL, required
+      NTFY_PUBLIC_URL: "https://ntfy.example.com"     # shown in curl examples
+      # COOKIE_SECURE: "false"                        # only for plain-HTTP testing
+      # SESSION_TTL: "12h"
+      # SVC_PREFIX: "svc-"
+      # TRUSTED_PROXIES: "172.16.0.0/12"              # your reverse proxy
+      # BASE_PATH: "/admin"
+    ports:
+      - "127.0.0.1:8080:8080"

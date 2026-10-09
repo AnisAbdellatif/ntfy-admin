@@ -1,0 +1,18 @@
+# Pinned ntfy for `make integration`. Bump the tag together with the
+# "Tested ntfy version" line in README.md, after the integration test passes.
+name: ntfy-admin-integration
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2.29.0
+    command: serve
+    ports:
+      - "127.0.0.1:18080:80"
+    volumes:
+      - ./server.yml:/etc/ntfy/server.yml:ro
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -q '\"healthy\":true'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

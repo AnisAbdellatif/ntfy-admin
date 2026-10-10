@@ -9,7 +9,7 @@ import (
 func TestStoreLifecycle(t *testing.T) {
 	var mu sync.Mutex
 	var revoked []string
-	st := NewStore(time.Hour, func(s *Session) {
+	st := NewStore(func(s *Session) {
 		mu.Lock()
 		revoked = append(revoked, s.Token)
 		mu.Unlock()
@@ -33,20 +33,37 @@ func TestStoreLifecycle(t *testing.T) {
 	if st.Get(a.ID) != nil {
 		t.Fatal("expired session must be nil")
 	}
-	if len(revoked) != 1 || revoked[0] != "tk_a" {
-		t.Fatalf("expired session token must be revoked, got %v", revoked)
-	}
+	// Revocation of an expired session runs in the background.
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(revoked) == 1 && revoked[0] == "tk_a"
+	})
 
 	st.Delete(b.ID)
 	st.Delete(b.ID) // no double revoke
+	mu.Lock()
+	defer mu.Unlock()
 	if len(revoked) != 2 || revoked[1] != "tk_b" {
 		t.Fatalf("deleted session token must be revoked once, got %v", revoked)
 	}
 }
 
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestSweepAndShutdown(t *testing.T) {
+	var mu sync.Mutex
 	n := 0
-	st := NewStore(time.Hour, func(*Session) { n++ })
+	st := NewStore(func(*Session) { mu.Lock(); n++; mu.Unlock() })
 	now := time.Now()
 	st.now = func() time.Time { return now }
 	st.Create("a", "tk_1", now.Add(time.Minute))
@@ -75,15 +92,25 @@ func TestSessionState(t *testing.T) {
 	if f := s.PopFlashes(); len(f) != 0 {
 		t.Fatal("flashes must be one-shot")
 	}
-	s.SetReveal(&Reveal{Account: "svc-a", Token: "tk_x"})
-	if s.PopReveal("svc-b") != nil {
+	id := s.AddReveal(&Reveal{Account: "svc-a", Token: "tk_x"})
+	id2 := s.AddReveal(&Reveal{Account: "svc-a", Token: "tk_y"})
+	if s.PopReveal(id, "svc-b") != nil {
 		t.Fatal("reveal must be bound to its account")
 	}
-	if r := s.PopReveal("svc-a"); r == nil || r.Token != "tk_x" {
-		t.Fatal("expected reveal")
+	if r := s.PopReveal(id, "svc-a"); r == nil || r.Token != "tk_x" {
+		t.Fatal("expected first reveal")
 	}
-	if s.PopReveal("svc-a") != nil {
+	if s.PopReveal(id, "svc-a") != nil {
 		t.Fatal("reveal must be one-shot")
+	}
+	if r := s.PopReveal(id2, "svc-a"); r == nil || r.Token != "tk_y" {
+		t.Fatal("concurrent reveals must not overwrite each other")
+	}
+	for range maxReveals + 5 {
+		s.AddReveal(&Reveal{Account: "svc-a"})
+	}
+	if len(s.reveals) != maxReveals {
+		t.Fatalf("unshown reveals must be capped, have %d", len(s.reveals))
 	}
 	s.SetTokenRefs("svc-a", []string{"tk_1", "tk_2"})
 	if tok, ok := s.TokenRef("svc-a", 1); !ok || tok != "tk_2" {

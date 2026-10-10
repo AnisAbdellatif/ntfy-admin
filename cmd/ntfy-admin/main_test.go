@@ -1,6 +1,9 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,5 +55,24 @@ func TestLoadConfigErrors(t *testing.T) {
 		if _, err := loadConfig(nil, env(e)); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
+	}
+}
+
+func TestHealthcheckHonoursFlagsAndEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/healthz" {
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	if code := healthcheck([]string{"-listen", addr, "-base-path", "/admin"}, env(nil)); code != 0 {
+		t.Fatalf("flags: exit %d", code)
+	}
+	if code := healthcheck(nil, env(map[string]string{"LISTEN": addr, "BASE_PATH": "admin/"})); code != 0 {
+		t.Fatalf("env: exit %d", code)
+	}
+	if code := healthcheck([]string{"-listen", addr}, env(nil)); code != 1 {
+		t.Fatalf("wrong base path must fail, exit %d", code)
 	}
 }

@@ -41,7 +41,7 @@
         {{- if not .IsSvc}}
         <details class="inline">
           <summary>Change password</summary>
-          <form method="post" action="{{userPath .Username}}/password" class="inline-form">
+          <form method="post" action="{{userPath .Username "/password"}}" class="inline-form">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <input type="hidden" name="back" value="users">
             <input name="password" type="password" required autocomplete="new-password" aria-label="New password for {{.Username}}">
@@ -51,7 +51,7 @@
         {{- else}}
         <a href="{{svcPath .Username}}">Tokens</a>
         {{- end}}
-        <form method="post" action="{{userPath .Username}}/delete" class="inline-form" data-confirm="Delete user “{{.Username}}”? This cuts their access immediately, including open subscriptions.">
+        <form method="post" action="{{userPath .Username "/delete"}}" class="inline-form" data-confirm="Delete user “{{.Username}}”? This cuts their access immediately, including open subscriptions.">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <button type="submit" class="btn-small btn-danger">Delete</button>
         </form>

@@ -62,8 +62,7 @@ type Account struct {
 
 type userAddRequest struct {
 	Username string `json:"username"`
-	Password string `json:"password,omitempty"`
-	Tier     string `json:"tier,omitempty"`
+	Password string `json:"password"`
 }
 
 type userDeleteRequest struct {

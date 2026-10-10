@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +73,13 @@ func TestIntegration(t *testing.T) {
 	topic := "it_topic_" + suffix
 
 	a := newApp(t, ntfyURL, nil)
+	t.Cleanup(func() {
+		// Leave nothing behind if a step fails halfway.
+		for _, name := range []string{user, user + "-na", svc} {
+			_ = api.DeleteUser(ctx, admin, name)
+		}
+		_ = api.Revoke(ctx, admin, ntfyapi.Everyone, topic)
+	})
 
 	countSessionTokens := func() int {
 		acc, err := api.Account(ctx, admin)
@@ -105,7 +111,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("non-admin login rejected", func(t *testing.T) {
-		if err := api.AddUser(ctx, admin, user+"-na", "pw-na", ""); err != nil {
+		if err := api.AddUser(ctx, admin, user+"-na", "pw-na"); err != nil {
 			t.Fatal(err)
 		}
 		defer api.DeleteUser(ctx, admin, user+"-na")
@@ -142,11 +148,18 @@ func TestIntegration(t *testing.T) {
 		}
 
 		r = a.get("/topics")
-		a.mustContain(r, topic, "public read-only")
+		if !strings.Contains(topicSection(t, r.Body, topic), `data-anon="read-only"`) {
+			t.Fatal("topic not shown as public read-only")
+		}
 
 		a.post("/topics/private", url.Values{"topic": {topic}})
 		if st := ntfyRequest(t, ntfyURL, "", topic, ""); st == http.StatusOK {
 			t.Fatal("anonymous read must be denied after make private")
+		}
+		users, _ = api.Users(ctx, admin)
+		anon, _ = findUser(users, ntfyapi.Everyone)
+		if !hasGrant(anon.Grants, topic, ntfyapi.PermDenyAll) {
+			t.Fatalf("make private must leave an explicit deny-all rule: %+v", anon.Grants)
 		}
 
 		a.post("/users/"+user+"/password", url.Values{"password": {"pw2"}})
@@ -179,7 +192,7 @@ func TestIntegration(t *testing.T) {
 		}
 
 		r = a.get("/service-accounts/" + svc)
-		a.mustContain(r, ntfyapi.MaskToken(tok1), "never")
+		a.mustContain(r, "<td><code>"+ntfyapi.MaskToken(tok1)+"</code></td>", "<td>never")
 		a.mustNotContain(r, tok1)
 
 		r = a.post("/service-accounts/"+svc+"/tokens", url.Values{"label": {"second"}, "expiry": {"30d"}})
@@ -192,11 +205,7 @@ func TestIntegration(t *testing.T) {
 		}
 
 		r = a.get("/service-accounts/" + svc)
-		m := regexp.MustCompile(regexp.QuoteMeta(ntfyapi.MaskToken(tok1)) + `</code>(?s:.*?)name="idx" value="(\d+)"`).FindStringSubmatch(r.Body)
-		if m == nil {
-			t.Fatal("token 1 not listed with a revoke form")
-		}
-		r = a.post("/service-accounts/"+svc+"/tokens/revoke", url.Values{"idx": {m[1]}, "masked": {ntfyapi.MaskToken(tok1)}})
+		r = a.post("/service-accounts/"+svc+"/tokens/revoke", url.Values{"idx": {tokenIndex(t, r.Body, tok1)}, "masked": {ntfyapi.MaskToken(tok1)}})
 		a.mustContain(r, "Token "+ntfyapi.MaskToken(tok1)+" revoked.")
 		a.mustNotContain(r, "<code>"+ntfyapi.MaskToken(tok1)+"</code>")
 		if st := ntfyRequest(t, ntfyURL, tok1, topic, "must fail"); st == http.StatusOK {
@@ -229,6 +238,63 @@ func TestIntegration(t *testing.T) {
 			t.Fatalf("session tokens after logout: %d, want %d", n, before)
 		}
 	})
+}
+
+// TestIntegrationNoUserMixup guards against ntfy v2.29.0's per-IP visitor
+// race: while an admin uses ntfy-admin, a regular user logging in must never
+// end up with the admin's identity. ntfy-admin prevents it by serializing
+// its requests to ntfy and by verifying every token it creates.
+func TestIntegrationNoUserMixup(t *testing.T) {
+	ntfyURL, admin := integrationEnv(t)
+	ctx := context.Background()
+	api := ntfyapi.New(ntfyURL, nil)
+	mallory := fmt.Sprintf("it-mallory-%d", time.Now().UnixNano()%1_000_000_000)
+	if err := api.AddUser(ctx, admin, mallory, "pw-m"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = api.DeleteUser(ctx, admin, mallory) })
+
+	a := newApp(t, ntfyURL, nil)
+	a.srv.limiter.perKey, a.srv.limiter.global = 1_000_000, 1_000_000 // not under test here
+	if r := a.login(admin.Username, admin.Password); r.Path != "/users" {
+		t.Fatal("admin login failed")
+	}
+	m := a.clone()
+	m.get("/login")
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { // admin traffic
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				req, _ := http.NewRequest(http.MethodGet, a.ts.URL+"/users", nil)
+				if resp, err := a.client.Do(req); err == nil {
+					resp.Body.Close()
+				}
+			}
+		}
+	}()
+	for i := range 60 {
+		_, body, err := m.rawPost("/login", url.Values{"username": {mallory}, "password": {"pw-m"}, "csrf": {m.csrf}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(body, "Log out") {
+			close(stop)
+			<-done
+			t.Fatalf("attempt %d: a regular user got an admin session", i)
+		}
+	}
+	close(stop)
+	<-done
+	acc, err := api.Account(ctx, ntfyapi.Basic{Username: mallory, Password: "pw-m"})
+	if err != nil || len(acc.Tokens) != 0 {
+		t.Fatalf("rejected logins must not leave tokens: %v %+v", err, acc)
+	}
 }
 
 func hasGrant(gs []ntfyapi.Grant, topic, perm string) bool {

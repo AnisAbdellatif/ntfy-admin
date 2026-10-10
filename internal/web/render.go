@@ -27,8 +27,8 @@ type pageData struct {
 func (s *Server) parseTemplates() error {
 	funcs := template.FuncMap{
 		"url":       s.url,
-		"userPath":  func(n string) string { return s.url(userPath(n)) },
-		"svcPath":   func(n string) string { return s.url(svcPath(n)) },
+		"userPath":  func(n string, sfx ...string) string { return s.url(userPath(n, sfx...)) },
+		"svcPath":   func(n string, sfx ...string) string { return s.url(svcPath(n, sfx...)) },
 		"mask":      ntfyapi.MaskToken,
 		"isPattern": ntfyapi.IsPattern,
 		"isSvc":     s.isSvc,

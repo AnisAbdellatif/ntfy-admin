@@ -145,3 +145,34 @@ func revealedToken(body string) string {
 	}
 	return ""
 }
+
+// topicSection returns the HTML of one topic card on the topics page.
+func topicSection(t *testing.T, body, topic string) string {
+	t.Helper()
+	start := strings.Index(body, `id="t-`+topic+`"`)
+	if start < 0 {
+		t.Fatalf("topic %q not on page", topic)
+	}
+	end := strings.Index(body[start:], "</section>")
+	return body[start : start+end]
+}
+
+// clone returns a second browser (own cookie jar) for the same server.
+func (a *testApp) clone() *testApp {
+	jar, _ := cookiejar.New(nil)
+	c := *a
+	c.client = &http.Client{Jar: jar}
+	c.csrf = ""
+	return &c
+}
+
+// tokenIndex returns the revoke-form index of the token shown masked on a
+// service account page.
+func tokenIndex(t *testing.T, body, token string) string {
+	t.Helper()
+	m := regexp.MustCompile(regexp.QuoteMeta(ntfyapi.MaskToken(token)) + `</code>(?s:.*?)name="idx" value="(\d+)"`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("token %s not listed with a revoke form", ntfyapi.MaskToken(token))
+	}
+	return m[1]
+}

@@ -30,12 +30,15 @@
 <p class="muted">No rules: this account only gets <code>auth-default-access</code>.</p>
 {{end}}
 <p><a href="{{userPath $a.Username}}">Edit rules →</a></p>
+{{template "configNote"}}
 
 <h2>Tokens</h2>
 {{with .Data.TokenError}}<div class="flash flash-error">{{.}}</div>{{end}}
+{{if .Data.TokensSkipped}}<p class="note">Tokens were not loaded because this page was opened from another site. <a href="{{svcPath $a.Username}}">Load tokens</a> (this sets a new random password on the account; its tokens stay valid).</p>{{end}}
+{{if .Data.TokensFull}}<div class="flash flash-error">This account has 60 tokens, ntfy's limit. Revoke one before issuing a new token.</div>{{end}}
 {{if .Data.Tokens}}
 <table class="data">
-  <thead><tr><th>Token</th><th>Label</th><th>Expires</th><th>Last used</th><th class="actions">Actions</th></tr></thead>
+  <thead><tr><th>Token</th><th>Label</th><th>Expires</th><th title="ntfy records the creation as the first access">Last access</th><th class="actions">Actions</th></tr></thead>
   <tbody>
   {{- range .Data.Tokens}}
     <tr{{if .Expired}} class="expired"{{end}}>
@@ -45,7 +48,7 @@
       <td>{{if .LastAccess}}{{unix .LastAccess}}{{if .LastOrigin}} from {{.LastOrigin}}{{end}}{{else}}–{{end}}</td>
       <td class="actions">
         {{if .Provisioned}}<span class="muted">from server.yml</span>{{else}}
-        <form method="post" action="{{svcPath $a.Username}}/tokens/revoke" class="inline-form" data-confirm="Revoke token {{.Masked}}{{if .Label}} ({{.Label}}){{end}}? Clients using it lose access immediately.">
+        <form method="post" action="{{svcPath $a.Username "/tokens/revoke"}}" class="inline-form" data-confirm="Revoke token {{.Masked}}{{if .Label}} ({{.Label}}){{end}}? Clients using it lose access immediately.">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="idx" value="{{.Index}}">
           <input type="hidden" name="masked" value="{{.Masked}}">
@@ -57,30 +60,30 @@
   {{- end}}
   </tbody>
 </table>
-{{else if not .Data.TokenError}}
+{{else if not (or .Data.TokenError .Data.TokensSkipped)}}
 <p class="muted">No tokens.</p>
 {{end}}
 
 <section class="card">
   <h3>Issue a new token</h3>
-  <form method="post" action="{{svcPath $a.Username}}/tokens" class="row">
+  <form method="post" action="{{svcPath $a.Username "/tokens"}}" class="row">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <label>Label <input name="label" maxlength="128" placeholder="e.g. nas backup script"></label>
     {{template "expiryInputs"}}
     <button type="submit" class="btn-primary">Issue token</button>
   </form>
-  <p class="hint">ntfy keeps at most 60 tokens per user and silently removes the oldest beyond that.</p>
+  <p class="hint">ntfy allows at most 60 tokens per user and would silently delete one beyond that (never-expiring tokens first), so ntfy-admin refuses to issue a 61st.</p>
 </section>
 
 <section class="card danger-zone">
   <h3>Offboarding</h3>
   <p>Both actions cut access immediately, including open subscriptions.</p>
   <div class="row">
-    <form method="post" action="{{svcPath $a.Username}}/disable" class="inline-form" data-confirm="Disable “{{$a.Username}}”? All its rules will be revoked.">
+    <form method="post" action="{{svcPath $a.Username "/disable"}}" class="inline-form" data-confirm="Disable “{{$a.Username}}”? All its rules will be revoked.">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button type="submit" class="btn-danger"{{if not .Data.Rules}} disabled{{end}}>Disable (revoke all rules)</button>
     </form>
-    <form method="post" action="{{svcPath $a.Username}}/delete" class="inline-form" data-confirm="Delete service account “{{$a.Username}}” and all its tokens?">
+    <form method="post" action="{{svcPath $a.Username "/delete"}}" class="inline-form" data-confirm="Delete service account “{{$a.Username}}” and all its tokens?">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button type="submit" class="btn-danger">Delete account</button>
     </form>

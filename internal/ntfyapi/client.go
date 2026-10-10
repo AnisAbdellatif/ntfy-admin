@@ -64,10 +64,28 @@ func IsForbidden(err error) bool { return StatusOf(err) == http.StatusForbidden 
 // IsConflict reports whether ntfy answered 409.
 func IsConflict(err error) bool { return StatusOf(err) == http.StatusConflict }
 
+// IsTooManyRequests reports whether ntfy answered 429 (rate limited).
+func IsTooManyRequests(err error) bool { return StatusOf(err) == http.StatusTooManyRequests }
+
+// IsServerError reports whether ntfy answered 500. ntfy uses it for some
+// refusals, e.g. changing a user or token provisioned in server.yml.
+func IsServerError(err error) bool { return StatusOf(err) == http.StatusInternalServerError }
+
+// ErrWrongUser means ntfy answered for a different user than the one that
+// authenticated. ntfy v2.29.0 can mix up users that share one client IP
+// under concurrent requests; every token ntfy-admin creates is checked.
+var ErrWrongUser = errors.New("ntfy answered for a different user than expected")
+
 // Client talks to one ntfy server.
+//
+// Requests are serialized: ntfy keys anonymous and tier-less users by client
+// IP, and concurrent requests from one IP with different identities can be
+// attributed to the wrong user (ntfy v2.29.0). Since all of ntfy-admin's
+// requests come from one IP, it never sends two at once.
 type Client struct {
 	baseURL string
 	http    *http.Client
+	sem     chan struct{}
 }
 
 // New creates a client for the ntfy server at baseURL (e.g. "http://ntfy:80").
@@ -75,7 +93,7 @@ func New(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient, sem: make(chan struct{}, 1)}
 }
 
 // BaseURL returns the configured ntfy base URL.
@@ -108,6 +126,12 @@ func (c *Client) do(ctx context.Context, auth Auth, method, path string, header 
 	if auth != nil {
 		auth.apply(req)
 	}
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("ntfy: %s %s: %w", method, path, ctx.Err())
+	}
+	defer func() { <-c.sem }()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("ntfy: %s %s: %w", method, path, err)
@@ -153,13 +177,14 @@ func (c *Client) Users(ctx context.Context, auth Auth) ([]User, error) {
 }
 
 // AddUser calls POST /v1/users. It always creates a regular user; 409 if it exists.
-func (c *Client) AddUser(ctx context.Context, auth Auth, username, password, tier string) error {
-	return c.do(ctx, auth, http.MethodPost, "/v1/users", nil, &userAddRequest{Username: username, Password: password, Tier: tier}, nil)
+func (c *Client) AddUser(ctx context.Context, auth Auth, username, password string) error {
+	return c.do(ctx, auth, http.MethodPost, "/v1/users", nil, &userAddRequest{Username: username, Password: password}, nil)
 }
 
-// UpdateUser calls PUT /v1/users. Careful: ntfy creates the user if it does not exist.
-func (c *Client) UpdateUser(ctx context.Context, auth Auth, username, password, tier string) error {
-	return c.do(ctx, auth, http.MethodPut, "/v1/users", nil, &userAddRequest{Username: username, Password: password, Tier: tier}, nil)
+// SetPassword calls PUT /v1/users with a new password. Careful: ntfy creates
+// the user if it does not exist, so callers must check existence first.
+func (c *Client) SetPassword(ctx context.Context, auth Auth, username, password string) error {
+	return c.do(ctx, auth, http.MethodPut, "/v1/users", nil, &userAddRequest{Username: username, Password: password}, nil)
 }
 
 // DeleteUser calls DELETE /v1/users (regular users only).
@@ -208,6 +233,25 @@ func (c *Client) DeleteToken(ctx context.Context, auth Auth, token string) error
 		return errors.New("ntfyapi: empty token")
 	}
 	return c.do(ctx, auth, http.MethodDelete, "/v1/account/token", http.Header{"X-Token": {token}}, nil, nil)
+}
+
+// CreateVerifiedToken creates a token as the user in auth, then checks with
+// the new token that ntfy really issued it for wantUser (see ErrWrongUser).
+// On a mismatch the token is revoked and ErrWrongUser is returned.
+func (c *Client) CreateVerifiedToken(ctx context.Context, auth Auth, wantUser, label string, expires int64) (*Token, error) {
+	tok, err := c.CreateToken(ctx, auth, label, expires)
+	if err != nil {
+		return nil, err
+	}
+	acc, err := c.Account(ctx, Bearer(tok.Token))
+	if err == nil && acc.Username == wantUser {
+		return tok, nil
+	}
+	_ = c.DeleteToken(ctx, Bearer(tok.Token), tok.Token)
+	if err != nil {
+		return nil, fmt.Errorf("verifying new token: %w", err)
+	}
+	return nil, fmt.Errorf("%w: wanted %q, got %q", ErrWrongUser, wantUser, acc.Username)
 }
 
 // Account calls GET /v1/account as the authenticated user.

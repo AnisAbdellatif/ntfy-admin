@@ -30,13 +30,13 @@ type Session struct {
 	Username string
 	Token    string // ntfy bearer token (tk_…), server-side only
 	CSRF     string
-	Created  time.Time
 	Expires  time.Time
 
-	mu        sync.Mutex
-	flashes   []Flash
-	reveal    *Reveal
-	tokenRefs map[string][]string // service account -> token values, in the order last shown
+	mu          sync.Mutex
+	flashes     []Flash
+	reveals     map[string]*Reveal // reveal ID -> token, until shown
+	revealOrder []string
+	tokenRefs   map[string][]string // service account -> token values, in the order last shown
 }
 
 // AddFlash queues a flash message.
@@ -55,22 +55,38 @@ func (s *Session) PopFlashes() []Flash {
 	return f
 }
 
-// SetReveal stores a token to show once.
-func (s *Session) SetReveal(r *Reveal) {
+// maxReveals bounds unshown tokens per session; the oldest are dropped.
+const maxReveals = 10
+
+// AddReveal stores a token to show once and returns its reveal ID, which the
+// redirect carries to the page that shows it. IDs keep concurrent tabs from
+// showing (and losing) each other's tokens.
+func (s *Session) AddReveal(r *Reveal) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reveal = r
+	if s.reveals == nil {
+		s.reveals = map[string]*Reveal{}
+	}
+	id := RandomString(12)
+	s.reveals[id] = r
+	s.revealOrder = append(s.revealOrder, id)
+	for len(s.revealOrder) > maxReveals {
+		delete(s.reveals, s.revealOrder[0])
+		s.revealOrder = s.revealOrder[1:]
+	}
+	return id
 }
 
-// PopReveal returns and clears the stored token if it belongs to account.
-func (s *Session) PopReveal(account string) *Reveal {
+// PopReveal returns and forgets the token with the given reveal ID, if it
+// belongs to account.
+func (s *Session) PopReveal(id, account string) *Reveal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := s.reveal
+	r := s.reveals[id]
 	if r == nil || r.Account != account {
 		return nil
 	}
-	s.reveal = nil
+	delete(s.reveals, id)
 	return r
 }
 
@@ -101,12 +117,11 @@ func (s *Session) ValidCSRF(token string) bool {
 	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.CSRF)) == 1
 }
 
-// RevokeFunc is called (in the background) when a session ends, to revoke its ntfy token.
+// RevokeFunc is called when a session ends, to revoke its ntfy token.
 type RevokeFunc func(s *Session)
 
 // Store is an in-memory session store.
 type Store struct {
-	ttl    time.Duration
 	revoke RevokeFunc
 	now    func() time.Time
 
@@ -115,12 +130,9 @@ type Store struct {
 }
 
 // NewStore creates a store. revoke may be nil.
-func NewStore(ttl time.Duration, revoke RevokeFunc) *Store {
-	return &Store{ttl: ttl, revoke: revoke, now: time.Now, sessions: map[string]*Session{}}
+func NewStore(revoke RevokeFunc) *Store {
+	return &Store{revoke: revoke, now: time.Now, sessions: map[string]*Session{}}
 }
-
-// TTL returns the session lifetime.
-func (st *Store) TTL() time.Duration { return st.ttl }
 
 // RandomString returns n random bytes, base64url-encoded.
 func RandomString(n int) string {
@@ -133,13 +145,11 @@ func RandomString(n int) string {
 
 // Create starts a session for an ntfy admin with the given bearer token.
 func (st *Store) Create(username, token string, expires time.Time) *Session {
-	now := st.now()
 	s := &Session{
 		ID:       RandomString(32),
 		Username: username,
 		Token:    token,
 		CSRF:     RandomString(32),
-		Created:  now,
 		Expires:  expires,
 	}
 	st.mu.Lock()
@@ -148,7 +158,8 @@ func (st *Store) Create(username, token string, expires time.Time) *Session {
 	return s
 }
 
-// Get returns a live session, or nil. Expired sessions are ended.
+// Get returns a live session, or nil. Expired sessions are ended; their
+// tokens are revoked in the background so the request is not held up.
 func (st *Store) Get(id string) *Session {
 	if id == "" {
 		return nil
@@ -158,7 +169,7 @@ func (st *Store) Get(id string) *Session {
 	if ok && !st.now().Before(s.Expires) {
 		delete(st.sessions, id)
 		st.mu.Unlock()
-		st.end(s)
+		go st.end(s)
 		return nil
 	}
 	st.mu.Unlock()
@@ -207,13 +218,20 @@ func (st *Store) Sweep() {
 }
 
 // Shutdown ends all sessions (used on graceful shutdown, so that no session
-// tokens are left behind in ntfy).
+// tokens are left behind in ntfy). Tokens are revoked concurrently; it
+// returns when all revocations have finished.
 func (st *Store) Shutdown() {
 	st.mu.Lock()
 	all := st.sessions
 	st.sessions = map[string]*Session{}
 	st.mu.Unlock()
+	var wg sync.WaitGroup
 	for _, s := range all {
-		st.end(s)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			st.end(s)
+		}()
 	}
+	wg.Wait()
 }

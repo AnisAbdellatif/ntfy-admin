@@ -25,7 +25,7 @@
       <td>{{template "perm" .Permission}}</td>
       {{- if $.Data.Editable}}
       <td class="actions">
-        <form method="post" action="{{userPath $u.Username}}/access/revoke" class="inline-form" data-confirm="Revoke {{.Permission}} on “{{.Topic}}” for {{display $u.Username}}?">
+        <form method="post" action="{{userPath $u.Username "/access/revoke"}}" class="inline-form" data-confirm="Revoke {{.Permission}} on “{{.Topic}}” for {{display $u.Username}}?">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="topic" value="{{.Topic}}">
           <button type="submit" class="btn-small btn-danger">Revoke</button>
@@ -43,7 +43,7 @@
 {{if .Data.Editable}}
 <section class="card">
   <h3>Add or change a rule</h3>
-  <form method="post" action="{{userPath $u.Username}}/access" class="row">
+  <form method="post" action="{{userPath $u.Username "/access"}}" class="row">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <label>Topic or pattern <input name="topic" required pattern="[\-_*A-Za-z0-9]{1,64}" maxlength="64" placeholder="alerts or backup_*"></label>
     <label>Permission <select name="permission">{{template "permOptions" .Permissions}}</select></label>
@@ -55,7 +55,7 @@
 <section class="card danger-zone">
   <h3>Revoke all rules</h3>
   <p>Removes every rule of {{display $u.Username}} at once and drops affected open subscriptions. Type <code>{{$u.Username}}</code> to confirm.</p>
-  <form method="post" action="{{userPath $u.Username}}/access/reset" class="row">
+  <form method="post" action="{{userPath $u.Username "/access/reset"}}" class="row">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input name="confirm" required autocomplete="off" aria-label="Type the username to confirm">
     <button type="submit" class="btn-danger">Revoke all rules</button>
@@ -67,7 +67,7 @@
 <section class="card">
   <h3>Change password</h3>
   <p class="hint">Existing tokens of this user stay valid after a password change.</p>
-  <form method="post" action="{{userPath $u.Username}}/password" class="row">
+  <form method="post" action="{{userPath $u.Username "/password"}}" class="row">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <span class="with-button">
       <input name="password" type="password" required autocomplete="new-password" id="user-pw" aria-label="New password">
@@ -81,8 +81,9 @@
 {{if eq $u.Role "user"}}
 <section class="card danger-zone">
   <h3>Delete user</h3>
-  <form method="post" action="{{userPath $u.Username}}/delete" data-confirm="Delete user “{{$u.Username}}”? This cuts their access immediately, including open subscriptions.">
+  <form method="post" action="{{userPath $u.Username "/delete"}}" data-confirm="Delete user “{{$u.Username}}”? This cuts their access immediately, including open subscriptions.">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
+    {{if .Data.IsSvc}}<input type="hidden" name="back" value="svc">{{end}}
     <button type="submit" class="btn-danger">Delete {{$u.Username}}</button>
   </form>
 </section>

@@ -3,7 +3,6 @@ package web
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"strings"
 
@@ -61,6 +60,10 @@ type ruleInput struct {
 	Permission string
 }
 
+// maxRules caps the rule rows of one form, which keeps the number of ntfy
+// calls per request (and thus its duration) bounded.
+const maxRules = 20
+
 // parseRules reads repeated "topic"/"permission" form fields, skipping blank rows.
 func parseRules(r *http.Request) ([]ruleInput, error) {
 	topics, perms := r.PostForm["topic"], r.PostForm["permission"]
@@ -81,6 +84,9 @@ func parseRules(r *http.Request) ([]ruleInput, error) {
 			return nil, fmt.Errorf("invalid permission %q", p)
 		}
 		rules = append(rules, ruleInput{Topic: t, Permission: p})
+		if len(rules) > maxRules {
+			return nil, fmt.Errorf("too many rules in one form (max %d); add the rest afterwards", maxRules)
+		}
 	}
 	return rules, nil
 }
@@ -116,7 +122,7 @@ func (s *Server) handleUserAdd(w http.ResponseWriter, r *http.Request, sess *ses
 		s.redirect(w, r, "/users")
 		return
 	}
-	err = s.ntfy.AddUser(r.Context(), ntfyapi.Bearer(sess.Token), username, password, "")
+	err = s.ntfy.AddUser(r.Context(), ntfyapi.Bearer(sess.Token), username, password)
 	s.auditLog(r, sess.Username, "user.add", username, err)
 	if ntfyapi.IsConflict(err) {
 		sess.AddFlash("error", fmt.Sprintf("User %q already exists.", username))
@@ -136,7 +142,7 @@ func (s *Server) handleUserAdd(w http.ResponseWriter, r *http.Request, sess *ses
 }
 
 func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	users, err := s.fetchUsers(r.Context(), sess)
 	if err != nil {
 		s.pageFailed(w, r, sess, err)
@@ -165,10 +171,7 @@ func (s *Server) backPath(r *http.Request, username string) string {
 	case "users":
 		return "/users"
 	case "topics":
-		if t := r.PostForm.Get("anchor"); ntfyapi.ValidTopicPattern(t) {
-			return "/topics#" + url.PathEscape("t-"+t)
-		}
-		return "/topics"
+		return topicBack(r.PostForm.Get("anchor"))
 	case "svc":
 		if s.isSvc(username) {
 			return svcPath(username)
@@ -199,7 +202,7 @@ func (s *Server) requireRegular(w http.ResponseWriter, r *http.Request, sess *se
 }
 
 func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := s.backPath(r, name)
 	password := r.PostForm.Get("password")
 	if password == "" {
@@ -207,13 +210,22 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request, sess
 		s.redirect(w, r, back)
 		return
 	}
+	if s.isSvc(name) {
+		// A known password would defeat the point of a token-only account.
+		sess.AddFlash("error", "Service accounts have no usable password; manage their tokens instead.")
+		s.redirect(w, r, back)
+		return
+	}
+	defer s.locks.lock(name)()
 	if !s.requireRegular(w, r, sess, name, back) {
 		return
 	}
-	err := s.ntfy.UpdateUser(r.Context(), ntfyapi.Bearer(sess.Token), name, password, "")
+	// requireRegular checked existence just now, under the per-user lock:
+	// ntfy would create a missing user here.
+	err := s.ntfy.SetPassword(r.Context(), ntfyapi.Bearer(sess.Token), name, password)
 	s.auditLog(r, sess.Username, "user.password", name, err)
 	if err != nil {
-		s.ntfyFailed(w, r, sess, back, err)
+		s.ntfyFailed(w, r, sess, back, provisionedHint(err))
 		return
 	}
 	sess.AddFlash("ok", fmt.Sprintf("Password of %q changed. Existing tokens of this user stay valid.", name))
@@ -221,18 +233,19 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request, sess
 }
 
 func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := "/users"
-	if s.isSvc(name) {
+	if r.PostForm.Get("back") == "svc" {
 		back = "/service-accounts"
 	}
+	defer s.locks.lock(name)()
 	if !s.requireRegular(w, r, sess, name, back) {
 		return
 	}
 	err := s.ntfy.DeleteUser(r.Context(), ntfyapi.Bearer(sess.Token), name)
 	s.auditLog(r, sess.Username, "user.delete", name, err)
 	if err != nil {
-		s.ntfyFailed(w, r, sess, back, err)
+		s.ntfyFailed(w, r, sess, back, provisionedHint(err))
 		return
 	}
 	sess.AddFlash("ok", fmt.Sprintf("User %q deleted.", name))
@@ -309,17 +322,17 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request, sess *session.Se
 }
 
 func (s *Server) handleUserGrant(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	s.grant(w, r, sess, name, strings.TrimSpace(r.PostForm.Get("topic")), r.PostForm.Get("permission"), s.backPath(r, name))
 }
 
 func (s *Server) handleUserRevoke(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	s.revoke(w, r, sess, name, r.PostForm.Get("topic"), s.backPath(r, name))
 }
 
 func (s *Server) handleUserRevokeAll(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := s.backPath(r, name)
 	if r.PostForm.Get("confirm") != name {
 		sess.AddFlash("error", "To revoke all rules, type the exact username into the confirmation field.")

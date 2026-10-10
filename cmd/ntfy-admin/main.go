@@ -32,7 +32,7 @@ type config struct {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(healthcheck(os.Getenv))
+		os.Exit(healthcheck(os.Args[2:], os.Getenv))
 	}
 	if err := run(os.Args[1:], os.Getenv); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -210,19 +210,28 @@ func run(args []string, getenv func(string) string) error {
 		return err
 	case <-ctx.Done():
 	}
+	// Docker's default stop timeout is 10s: drain requests for up to 3s, then
+	// revoke all session tokens concurrently (5s timeout each).
 	logger.Info("shutting down; revoking session tokens", "sessions", srv.Sessions().Len())
 	close(stopJanitor)
-	sctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(sctx)
 	srv.Sessions().Shutdown()
 	return nil
 }
 
-// healthcheck is used by the container HEALTHCHECK (no shell or curl in the image).
-func healthcheck(getenv func(string) string) int {
-	listen := envOr(getenv, "LISTEN", ":8080")
-	host, port, err := net.SplitHostPort(listen)
+// healthcheck is used by the container HEALTHCHECK (no shell or curl in the
+// image). It reads LISTEN and BASE_PATH like the server, and accepts the same
+// -listen and -base-path flags.
+func healthcheck(args []string, getenv func(string) string) int {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	listen := fs.String("listen", envOr(getenv, "LISTEN", ":8080"), "listen address")
+	basePath := fs.String("base-path", envOr(getenv, "BASE_PATH", ""), "base path")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	host, port, err := net.SplitHostPort(*listen)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck:", err)
 		return 1
@@ -230,7 +239,7 @@ func healthcheck(getenv func(string) string) int {
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
-	u := "http://" + net.JoinHostPort(host, port) + web.NormalizeBasePath(getenv("BASE_PATH")) + "/healthz"
+	u := "http://" + net.JoinHostPort(host, port) + web.NormalizeBasePath(*basePath) + "/healthz"
 	c := &http.Client{Timeout: 3 * time.Second}
 	resp, err := c.Get(u)
 	if err != nil {

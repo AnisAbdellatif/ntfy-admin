@@ -46,17 +46,23 @@
     <div class="topic-head">
       <h2><code>{{.Topic}}</code>{{if .IsPattern}} <span class="badge badge-pattern">pattern</span>{{end}}</h2>
       <div class="topic-actions">
-        {{if eq .Public "read-only"}}<span class="badge badge-public">public read-only</span>{{else if .Public}}<span class="badge badge-public">anonymous: {{.Public}}</span>{{end}}
+        {{if .IsPattern}}
+          {{if .Public}}<span class="badge badge-public" data-anon="{{.Public}}">anonymous: {{.Public}}</span>{{end}}
+        {{else if .AnonVia}}
+          <span class="badge badge-public" data-anon="{{.Anon}}">anonymous: {{.Anon}}{{if ne .AnonVia .Topic}} via {{.AnonVia}}{{end}}</span>
+        {{else}}
+          <span class="badge" data-anon="default">anonymous: auth-default-access</span>
+        {{end}}
         {{if ne .Public "read-only"}}
         <form method="post" action="{{url "/topics/public"}}" class="inline-form" data-confirm="Allow everyone (anonymous) to read “{{.Topic}}”?">
           <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="topic" value="{{.Topic}}">
           <button type="submit" class="btn-small">Make public read-only</button>
         </form>
         {{end}}
-        {{if .Public}}
-        <form method="post" action="{{url "/topics/private"}}" class="inline-form" data-confirm="Remove the anonymous rule on “{{.Topic}}”?">
+        {{if ne .Public "deny-all"}}
+        <form method="post" action="{{url "/topics/private"}}" class="inline-form" data-confirm="Deny everyone (anonymous) access to “{{.Topic}}”? Signed-in users keep their own rules.">
           <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="topic" value="{{.Topic}}">
-          <button type="submit" class="btn-small">Make private</button>
+          <button type="submit" class="btn-small">Make private (deny anonymous)</button>
         </form>
         {{end}}
       </div>

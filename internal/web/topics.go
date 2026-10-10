@@ -22,8 +22,12 @@ type topicRow struct {
 	Topic     string
 	IsPattern bool
 	Entries   []topicEntry
-	Public    string   // permission of "*" on this exact ACL entry, if any
+	Public    string   // permission of the "*" rule on this exact ACL entry, if any
 	MatchedBy []string // for exact topics: patterns that also match it
+	// Effective anonymous access to an exact topic, following ntfy's rule
+	// order: AnonVia is the "*" rule that decides it ("" = auth-default-access).
+	Anon    string
+	AnonVia string
 }
 
 type matrixRow struct {
@@ -56,6 +60,12 @@ func (s *Server) buildTopics(users []ntfyapi.User) []topicRow {
 			}
 		}
 	}
+	var anonGrants []ntfyapi.Grant
+	for _, u := range users {
+		if u.Username == ntfyapi.Everyone {
+			anonGrants = u.Grants
+		}
+	}
 	var patterns []string
 	rows := make([]topicRow, 0, len(byTopic))
 	for _, row := range byTopic {
@@ -76,6 +86,9 @@ func (s *Server) buildTopics(users []ntfyapi.User) []topicRow {
 	for i := range rows {
 		if rows[i].IsPattern {
 			continue
+		}
+		if g, ok := ntfyapi.EffectiveAccess(anonGrants, rows[i].Topic); ok {
+			rows[i].Anon, rows[i].AnonVia = g.Permission, g.Topic
 		}
 		for _, p := range patterns {
 			if ntfyapi.MatchTopic(p, rows[i].Topic) {
@@ -152,7 +165,9 @@ func (s *Server) handleTopicPublic(w http.ResponseWriter, r *http.Request, sess 
 	s.grant(w, r, sess, ntfyapi.Everyone, topic, ntfyapi.PermReadOnly, topicBack(topic))
 }
 
+// handleTopicPrivate denies anonymous access explicitly. Removing the "*"
+// rule instead would fall back to auth-default-access, which may be public.
 func (s *Server) handleTopicPrivate(w http.ResponseWriter, r *http.Request, sess *session.Session) {
 	topic := r.PostForm.Get("topic")
-	s.revoke(w, r, sess, ntfyapi.Everyone, topic, topicBack(topic))
+	s.grant(w, r, sess, ntfyapi.Everyone, topic, ntfyapi.PermDenyAll, topicBack(topic))
 }

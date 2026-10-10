@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"ntfy-admin/internal/ntfyapi"
@@ -29,6 +30,11 @@ const (
 	sessionCookie   = "ntfy_admin_session"
 	loginCSRFCookie = "ntfy_admin_login_csrf"
 	sessionLabel    = "ntfy-admin session"
+
+	// requestDeadline bounds all ntfy calls of one request, below the HTTP
+	// server's WriteTimeout, so a slow ntfy yields an error page instead of a
+	// dropped connection.
+	requestDeadline = 45 * time.Second
 )
 
 // Config configures the web server.
@@ -49,7 +55,9 @@ type Server struct {
 	ntfy     *ntfyapi.Client
 	sessions *session.Store
 	limiter  *loginLimiter
+	locks    keyedMutex
 	pages    map[string]*template.Template
+	xffWarn  sync.Once
 	log      *slog.Logger
 	audit    *slog.Logger
 }
@@ -71,11 +79,11 @@ func New(cfg Config, client *ntfyapi.Client, log, audit *slog.Logger) (*Server, 
 	s := &Server{
 		cfg:     cfg,
 		ntfy:    client,
-		limiter: newLoginLimiter(5, 15*time.Minute),
+		limiter: newLoginLimiter(),
 		log:     log,
 		audit:   audit,
 	}
-	s.sessions = session.NewStore(cfg.SessionTTL, s.revokeSessionToken)
+	s.sessions = session.NewStore(s.revokeSessionToken)
 	if err := s.parseTemplates(); err != nil {
 		return nil, err
 	}
@@ -98,7 +106,7 @@ func NormalizeBasePath(p string) string {
 }
 
 func (s *Server) revokeSessionToken(sess *session.Session) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.ntfy.DeleteToken(ctx, ntfyapi.Bearer(sess.Token), sess.Token)
 	if err != nil && !ntfyapi.IsUnauthorized(err) {
@@ -196,7 +204,7 @@ func (s *Server) authed(h authedHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		var sess *session.Session
-		if c, err := r.Cookie(sessionCookie); err == nil {
+		if c, err := r.Cookie(s.cookieName(sessionCookie)); err == nil {
 			sess = s.sessions.Get(c.Value)
 		}
 		if sess == nil {
@@ -207,6 +215,9 @@ func (s *Server) authed(h authedHandler) http.Handler {
 			}
 			return
 		}
+		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+		defer cancel()
+		r = r.WithContext(ctx)
 		if r.Method == http.MethodPost {
 			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 			if err := r.ParseForm(); err != nil {
@@ -230,8 +241,43 @@ func (s *Server) redirect(w http.ResponseWriter, r *http.Request, p string) {
 	http.Redirect(w, r, s.url(p), http.StatusSeeOther)
 }
 
-func userPath(name string) string { return "/users/" + url.PathEscape(name) }
-func svcPath(name string) string  { return "/service-accounts/" + url.PathEscape(name) }
+// nameSentinel stands in for usernames that cannot be a path segment ("."
+// and "..", which ServeMux cleans away); the real name is then passed as the
+// "name" query parameter. "~" is not a valid ntfy username.
+const nameSentinel = "~"
+
+func entityPath(prefix, name string, suffix []string) string {
+	sfx := strings.Join(suffix, "")
+	if name == "." || name == ".." {
+		return prefix + nameSentinel + sfx + "?name=" + url.QueryEscape(name)
+	}
+	return prefix + url.PathEscape(name) + sfx
+}
+
+// userPath returns /users/{name}[suffix], e.g. userPath("bob", "/delete").
+func userPath(name string, suffix ...string) string { return entityPath("/users/", name, suffix) }
+
+// svcPath returns /service-accounts/{name}[suffix].
+func svcPath(name string, suffix ...string) string {
+	return entityPath("/service-accounts/", name, suffix)
+}
+
+// withQuery appends a query parameter to an app path.
+func withQuery(p, key, value string) string {
+	sep := "?"
+	if strings.Contains(p, "?") {
+		sep = "&"
+	}
+	return p + sep + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+}
+
+// nameParam returns the {name} path value, resolving nameSentinel.
+func nameParam(r *http.Request) string {
+	if v := r.PathValue("name"); v != nameSentinel {
+		return v
+	}
+	return r.URL.Query().Get("name")
+}
 
 // ntfyFailed handles an error from ntfy for a mutation or page load. It ends
 // the session on 401 (token gone or no longer admin) and otherwise flashes
@@ -242,6 +288,9 @@ func (s *Server) ntfyFailed(w http.ResponseWriter, r *http.Request, sess *sessio
 		s.clearSessionCookie(w)
 		s.redirect(w, r, "/login?expired=1")
 		return
+	}
+	if ntfyapi.StatusOf(err) == 0 {
+		s.log.Error("ntfy request failed", "path", r.URL.Path, "err", err)
 	}
 	sess.AddFlash("error", describeErr(err))
 	s.redirect(w, r, back)
@@ -258,10 +307,15 @@ func (s *Server) pageFailed(w http.ResponseWriter, r *http.Request, sess *sessio
 	s.renderStatus(w, r, sess, http.StatusBadGateway, "error", "Error", map[string]any{"Message": describeErr(err)})
 }
 
+// describeErr turns an error into a message for the UI. Transport errors
+// are not shown in detail (they reveal internal addresses); they are logged.
 func describeErr(err error) string {
 	var es errString
 	if errors.As(err, &es) {
 		return string(es)
+	}
+	if errors.Is(err, ntfyapi.ErrWrongUser) {
+		return "ntfy answered for a different user than expected; the action was aborted. Please try again."
 	}
 	var apiErr *ntfyapi.APIError
 	if errors.As(err, &apiErr) {
@@ -270,17 +324,76 @@ func describeErr(err error) string {
 			return "Session expired or not permitted (ntfy: " + apiErr.Message + ")"
 		case http.StatusForbidden:
 			return "Not permitted by ntfy: " + apiErr.Message
+		case http.StatusTooManyRequests:
+			return "ntfy is rate-limiting ntfy-admin (" + apiErr.Message + "). All of ntfy-admin's requests come from one address; wait a few minutes and try again."
 		}
 		return "ntfy error: " + apiErr.Message
 	}
-	return "Could not reach ntfy: " + err.Error()
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "ntfy did not answer in time. Some changes may have been applied; check the current state."
+	}
+	return "Could not reach ntfy. See the ntfy-admin logs for details."
+}
+
+// provisionedHint explains ntfy's HTTP 500 on user changes: ntfy refuses
+// to change or delete users defined in server.yml (auth-users) that way.
+func provisionedHint(err error) error {
+	if ntfyapi.IsServerError(err) {
+		return errString("ntfy refused this change (internal server error). This usually means the user is defined in server.yml (auth-users), which cannot be changed through the API.")
+	}
+	return err
+}
+
+// keyedMutex serializes work per key (a username), so that two requests
+// cannot interleave read-check-write sequences on the same user.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock acquires the lock for key and returns its release function.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[string]*keyedLock{}
+	}
+	l := k.locks[key]
+	if l == nil {
+		l = &keyedLock{}
+		k.locks[key] = l
+	}
+	l.refs++
+	k.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		k.mu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: "", Path: s.cookiePath(), MaxAge: -1,
+		Name: s.cookieName(sessionCookie), Value: "", Path: s.cookiePath(), MaxAge: -1,
 		HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// cookieName adds the __Host- prefix when the browser allows it (Secure
+// cookie with path "/"), which keeps sibling subdomains from setting it.
+func (s *Server) cookieName(name string) string {
+	if s.cfg.CookieSecure && s.cfg.BasePath == "" {
+		return "__Host-" + name
+	}
+	return name
 }
 
 func (s *Server) cookiePath() string {

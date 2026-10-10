@@ -1,10 +1,13 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -103,6 +106,7 @@ func (s *Server) handleSvcCreate(w http.ResponseWriter, r *http.Request, sess *s
 		s.redirect(w, r, "/service-accounts")
 		return
 	}
+	defer s.locks.lock(name)()
 	if _, exists, err := s.lookupUser(r.Context(), sess, name); err != nil {
 		s.ntfyFailed(w, r, sess, "/service-accounts", err)
 		return
@@ -114,7 +118,7 @@ func (s *Server) handleSvcCreate(w http.ResponseWriter, r *http.Request, sess *s
 
 	// Random password: generated here, used once for the token call, never shown or stored.
 	password := session.RandomString(32)
-	err := s.ntfy.AddUser(r.Context(), ntfyapi.Bearer(sess.Token), name, password, "")
+	err := s.ntfy.AddUser(r.Context(), ntfyapi.Bearer(sess.Token), name, password)
 	s.auditLog(r, sess.Username, "svc.create", name, err)
 	if ntfyapi.IsConflict(err) {
 		sess.AddFlash("error", fmt.Sprintf("User %q already exists.", name))
@@ -129,7 +133,7 @@ func (s *Server) handleSvcCreate(w http.ResponseWriter, r *http.Request, sess *s
 		s.ntfyFailed(w, r, sess, svcPath(name), err)
 		return
 	}
-	tok, err := s.ntfy.CreateToken(r.Context(), ntfyapi.Basic{Username: name, Password: password}, label, expires)
+	tok, err := s.ntfy.CreateVerifiedToken(r.Context(), ntfyapi.Basic{Username: name, Password: password}, name, label, expires)
 	if err != nil {
 		s.auditLog(r, sess.Username, "svc.token.issue", name, err)
 		sess.AddFlash("ok", fmt.Sprintf("Service account %q created, but issuing the token failed.", name))
@@ -137,9 +141,9 @@ func (s *Server) handleSvcCreate(w http.ResponseWriter, r *http.Request, sess *s
 		return
 	}
 	s.auditLog(r, sess.Username, "svc.token.issue", name+" "+ntfyapi.MaskToken(tok.Token), nil)
-	sess.SetReveal(&session.Reveal{Account: name, Token: tok.Token, Label: tok.Label, Expires: tok.Expires})
+	reveal := sess.AddReveal(&session.Reveal{Account: name, Token: tok.Token, Label: tok.Label, Expires: tok.Expires})
 	sess.AddFlash("ok", fmt.Sprintf("Service account %q created with %d rule(s).", name, len(rules)))
-	s.redirect(w, r, svcPath(name))
+	s.redirect(w, r, withQuery(svcPath(name), "reveal", reveal))
 }
 
 // basicErr rewrites a 401 from a call authenticated as a service account, so
@@ -157,7 +161,8 @@ var (
 )
 
 // requireSvc checks that name is an existing, regular service account. It
-// must run before any PUT /v1/users, because ntfy creates missing users there.
+// must run before any PUT /v1/users, because ntfy creates missing users
+// there, and the caller must hold s.locks for name.
 func (s *Server) requireSvc(ctx context.Context, sess *session.Session, name string) (ntfyapi.User, error) {
 	if !s.isSvc(name) || !ntfyapi.ValidUsername(name) {
 		return ntfyapi.User{}, errNotSvc
@@ -173,14 +178,28 @@ func (s *Server) requireSvc(ctx context.Context, sess *session.Session, name str
 	return u, nil
 }
 
-// svcAuth sets a fresh random password on a service account and returns
-// Basic credentials for it. Existing tokens stay valid; the password is
-// discarded after the request.
-func (s *Server) svcAuth(r *http.Request, sess *session.Session, name string) (ntfyapi.Basic, error) {
-	password := session.RandomString(32)
-	err := s.ntfy.UpdateUser(r.Context(), ntfyapi.Bearer(sess.Token), name, password, "")
+// svcAccount sets a fresh random password on a service account and reads
+// its account (tokens) with it. Existing tokens stay valid; the password is
+// discarded with the returned credentials after the request. The caller
+// must have run requireSvc under s.locks for name.
+func (s *Server) svcAccount(r *http.Request, sess *session.Session, name string) (ntfyapi.Basic, *ntfyapi.Account, error) {
+	auth := ntfyapi.Basic{Username: name, Password: session.RandomString(32)}
+	err := s.ntfy.SetPassword(r.Context(), ntfyapi.Bearer(sess.Token), name, auth.Password)
 	s.auditLog(r, sess.Username, "svc.rotate-password", name, err)
-	return ntfyapi.Basic{Username: name, Password: password}, err
+	if err != nil {
+		if ntfyapi.IsServerError(err) {
+			return auth, nil, errString("ntfy refused to manage this account (internal server error). Service accounts defined in server.yml (auth-users) cannot be managed through the API; their tokens belong in auth-tokens.")
+		}
+		return auth, nil, err
+	}
+	acc, err := s.ntfy.Account(r.Context(), auth)
+	if err != nil {
+		return auth, nil, basicErr(err)
+	}
+	if acc.Username != name {
+		return auth, nil, fmt.Errorf("%w: wanted %q, got %q", ntfyapi.ErrWrongUser, name, acc.Username)
+	}
+	return auth, acc, nil
 }
 
 // svcPrecheck runs requireSvc and handles its errors for POST handlers.
@@ -201,8 +220,21 @@ func (s *Server) svcPrecheck(w http.ResponseWriter, r *http.Request, sess *sessi
 	return false
 }
 
+// crossSiteGET reports whether a GET was triggered from another site (or is
+// a HEAD request). Loading tokens rotates the account's password, which a
+// mere link from elsewhere (SameSite=Strict still allows same-site) should
+// not trigger.
+func crossSiteGET(r *http.Request) bool {
+	if r.Method == http.MethodHead {
+		return true
+	}
+	site := r.Header.Get("Sec-Fetch-Site")
+	return site == "cross-site" || site == "same-site"
+}
+
 func (s *Server) handleSvc(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
+	defer s.locks.lock(name)()
 	u, err := s.requireSvc(r.Context(), sess, name)
 	switch {
 	case errors.Is(err, errNoSuchUser):
@@ -218,41 +250,51 @@ func (s *Server) handleSvc(w http.ResponseWriter, r *http.Request, sess *session
 	data := map[string]any{
 		"Account": u,
 		"Rules":   sortGrants(u.Grants),
-		"Reveal":  sess.PopReveal(name),
+		"Reveal":  sess.PopReveal(r.URL.Query().Get("reveal"), name),
 		"NtfyURL": s.cfg.NtfyPublicURL,
 		"Example": exampleFor(u.Grants),
-		"MinDate": time.Now().AddDate(0, 0, 1).Format("2006-01-02"),
 	}
-	auth, err := s.svcAuth(r, sess, name)
-	if err == nil {
-		var acc *ntfyapi.Account
-		acc, err = s.ntfy.Account(r.Context(), auth)
-		if err == nil {
-			now := time.Now().Unix()
-			refs := make([]string, len(acc.Tokens))
-			rows := make([]tokenRow, len(acc.Tokens))
-			for i, t := range acc.Tokens {
-				refs[i] = t.Token
-				rows[i] = tokenRow{
-					Index: i, Masked: ntfyapi.MaskToken(t.Token), Label: t.Label,
-					Expires: t.Expires, Expired: t.Expires != 0 && t.Expires <= now,
-					LastAccess: t.LastAccess, LastOrigin: t.LastOrigin, Provisioned: t.Provisioned,
-				}
-			}
-			sess.SetTokenRefs(name, refs)
-			data["Tokens"] = rows
-		} else {
-			err = basicErr(err)
-		}
+	if crossSiteGET(r) {
+		data["TokensSkipped"] = true
+		s.render(w, r, sess, "svc", name, data)
+		return
 	}
+	_, acc, err := s.svcAccount(r, sess, name)
 	if err != nil {
 		if ntfyapi.IsUnauthorized(err) {
 			s.pageFailed(w, r, sess, err)
 			return
 		}
 		data["TokenError"] = describeErr(err)
+		s.render(w, r, sess, "svc", name, data)
+		return
 	}
+	// Soonest expiry first, never-expiring last; ntfy's own order is random.
+	slices.SortStableFunc(acc.Tokens, func(a, b ntfyapi.Token) int {
+		return cmp.Compare(sortableExpiry(a.Expires), sortableExpiry(b.Expires))
+	})
+	now := time.Now().Unix()
+	refs := make([]string, len(acc.Tokens))
+	rows := make([]tokenRow, len(acc.Tokens))
+	for i, t := range acc.Tokens {
+		refs[i] = t.Token
+		rows[i] = tokenRow{
+			Index: i, Masked: ntfyapi.MaskToken(t.Token), Label: t.Label,
+			Expires: t.Expires, Expired: t.Expires != 0 && t.Expires <= now,
+			LastAccess: t.LastAccess, LastOrigin: t.LastOrigin, Provisioned: t.Provisioned,
+		}
+	}
+	sess.SetTokenRefs(name, refs)
+	data["Tokens"] = rows
+	data["TokensFull"] = len(rows) >= maxTokens
 	s.render(w, r, sess, "svc", name, data)
+}
+
+func sortableExpiry(e int64) int64 {
+	if e == 0 {
+		return math.MaxInt64
+	}
+	return e
 }
 
 // example picks a topic for the curl examples and which of them apply.
@@ -276,7 +318,7 @@ func exampleFor(grants []ntfyapi.Grant) example {
 }
 
 func (s *Server) handleSvcTokenIssue(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := svcPath(name)
 	expires, expErr := parseExpiry(r, time.Now())
 	label, labelErr := parseLabel(r)
@@ -285,28 +327,34 @@ func (s *Server) handleSvcTokenIssue(w http.ResponseWriter, r *http.Request, ses
 		s.redirect(w, r, back)
 		return
 	}
+	defer s.locks.lock(name)()
 	if !s.svcPrecheck(w, r, sess, name) {
 		return
 	}
-	auth, err := s.svcAuth(r, sess, name)
+	auth, acc, err := s.svcAccount(r, sess, name)
 	if err != nil {
 		s.ntfyFailed(w, r, sess, back, err)
 		return
 	}
-	tok, err := s.ntfy.CreateToken(r.Context(), auth, label, expires)
+	if len(acc.Tokens) >= maxTokens {
+		sess.AddFlash("error", "This account already has 60 tokens, ntfy's limit. Revoke one first: ntfy would otherwise silently delete a token, never-expiring ones first.")
+		s.redirect(w, r, back)
+		return
+	}
+	tok, err := s.ntfy.CreateVerifiedToken(r.Context(), auth, name, label, expires)
 	if err != nil {
 		s.auditLog(r, sess.Username, "svc.token.issue", name, err)
 		s.ntfyFailed(w, r, sess, back, basicErr(err))
 		return
 	}
 	s.auditLog(r, sess.Username, "svc.token.issue", name+" "+ntfyapi.MaskToken(tok.Token), nil)
-	sess.SetReveal(&session.Reveal{Account: name, Token: tok.Token, Label: tok.Label, Expires: tok.Expires})
+	reveal := sess.AddReveal(&session.Reveal{Account: name, Token: tok.Token, Label: tok.Label, Expires: tok.Expires})
 	sess.AddFlash("ok", "Token issued.")
-	s.redirect(w, r, back)
+	s.redirect(w, r, withQuery(back, "reveal", reveal))
 }
 
 func (s *Server) handleSvcTokenRevoke(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := svcPath(name)
 	// The index refers to the list this session last displayed; the masked
 	// value guards against a stale page pointing at a different token.
@@ -317,32 +365,36 @@ func (s *Server) handleSvcTokenRevoke(w http.ResponseWriter, r *http.Request, se
 		s.redirect(w, r, back)
 		return
 	}
+	defer s.locks.lock(name)()
 	if !s.svcPrecheck(w, r, sess, name) {
 		return
 	}
-	auth, err := s.svcAuth(r, sess, name)
+	auth, _, err := s.svcAccount(r, sess, name)
 	if err != nil {
 		s.ntfyFailed(w, r, sess, back, err)
 		return
 	}
 	err = s.ntfy.DeleteToken(r.Context(), auth, token)
 	s.auditLog(r, sess.Username, "svc.token.revoke", name+" "+ntfyapi.MaskToken(token), err)
-	if ntfyapi.IsConflict(err) {
+	switch {
+	case ntfyapi.IsConflict(err):
 		sess.AddFlash("error", "This token is provisioned in server.yml (auth-tokens) and cannot be revoked here.")
-		s.redirect(w, r, back)
-		return
-	} else if err != nil {
+	case ntfyapi.IsServerError(err):
+		// ntfy answers 500 for tokens that no longer exist.
+		sess.AddFlash("error", fmt.Sprintf("Token %s no longer exists (already revoked or expired).", ntfyapi.MaskToken(token)))
+	case err != nil:
 		s.ntfyFailed(w, r, sess, back, basicErr(err))
 		return
+	default:
+		sess.AddFlash("ok", fmt.Sprintf("Token %s revoked.", ntfyapi.MaskToken(token)))
 	}
-	sess.SetTokenRefs(name, nil)
-	sess.AddFlash("ok", fmt.Sprintf("Token %s revoked.", ntfyapi.MaskToken(token)))
 	s.redirect(w, r, back)
 }
 
 func (s *Server) handleSvcDisable(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
 	back := svcPath(name)
+	defer s.locks.lock(name)()
 	if !s.svcPrecheck(w, r, sess, name) {
 		return
 	}
@@ -352,19 +404,20 @@ func (s *Server) handleSvcDisable(w http.ResponseWriter, r *http.Request, sess *
 		s.ntfyFailed(w, r, sess, back, err)
 		return
 	}
-	sess.AddFlash("ok", fmt.Sprintf("Service account %q disabled: all rules revoked. Its tokens now only get auth-default-access.", name))
+	sess.AddFlash("ok", fmt.Sprintf("Service account %q disabled: all its rules were revoked. Its tokens now only get the anonymous (Everyone) rules and auth-default-access.", name))
 	s.redirect(w, r, back)
 }
 
 func (s *Server) handleSvcDelete(w http.ResponseWriter, r *http.Request, sess *session.Session) {
-	name := r.PathValue("name")
+	name := nameParam(r)
+	defer s.locks.lock(name)()
 	if !s.svcPrecheck(w, r, sess, name) {
 		return
 	}
 	err := s.ntfy.DeleteUser(r.Context(), ntfyapi.Bearer(sess.Token), name)
 	s.auditLog(r, sess.Username, "svc.delete", name, err)
 	if err != nil {
-		s.ntfyFailed(w, r, sess, svcPath(name), err)
+		s.ntfyFailed(w, r, sess, svcPath(name), provisionedHint(err))
 		return
 	}
 	sess.AddFlash("ok", fmt.Sprintf("Service account %q deleted.", name))

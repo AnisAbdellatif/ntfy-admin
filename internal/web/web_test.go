@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,7 +52,7 @@ func TestLoginLogout(t *testing.T) {
 	if len(toks) != 1 || toks[0].Label != sessionLabel {
 		t.Fatalf("expected one session token, got %+v", toks)
 	}
-	wantExp := time.Now().Add(12*time.Hour + tokenGrace).Unix()
+	wantExp := time.Now().Add(12*time.Hour + 5*time.Minute).Unix() // session TTL + grace
 	if d := toks[0].Expires - wantExp; d < -5 || d > 5 {
 		t.Fatalf("session token expiry off by %ds", d)
 	}
@@ -96,8 +97,11 @@ func TestLoginRateLimit(t *testing.T) {
 	if r.Status != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d", r.Status)
 	}
-	if n := f.CountCalls("POST /v1/account/token"); n != 5 {
-		t.Fatalf("blocked logins must not reach ntfy, got %d token calls", n)
+	if n := f.CountCalls("GET /v1/account"); n != 5 {
+		t.Fatalf("blocked logins must not reach ntfy, got %d account calls", n)
+	}
+	if n := f.CountCalls("POST /v1/account/token"); n != 0 {
+		t.Fatalf("failed logins must not create tokens, got %d", n)
 	}
 }
 
@@ -111,10 +115,18 @@ func TestLoginMinDelay(t *testing.T) {
 }
 
 func TestLoginCSRF(t *testing.T) {
-	_, a := setup(t, nil)
+	f, a := setup(t, nil)
 	r := a.post("/login", url.Values{"username": {"admin"}, "password": {"adminpw"}, "csrf": {"forged"}})
 	if r.Status != http.StatusForbidden {
-		t.Fatalf("login without matching CSRF cookie: %d", r.Status)
+		t.Fatalf("login without CSRF cookie: %d", r.Status)
+	}
+	a.get("/login") // sets the cookie
+	r = a.post("/login", url.Values{"username": {"admin"}, "password": {"adminpw"}, "csrf": {strings.Repeat("x", 43)}})
+	if r.Status != http.StatusForbidden {
+		t.Fatalf("login with mismatching CSRF cookie: %d", r.Status)
+	}
+	if f.CountCalls("GET /v1/account") != 0 {
+		t.Fatal("CSRF failures must not reach ntfy")
 	}
 }
 
@@ -159,12 +171,12 @@ func TestSessionCookieFlags(t *testing.T) {
 	form := url.Values{"username": {"admin"}, "password": {"adminpw"}, "csrf": {csrf}}
 	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: csrf})
+	req.AddCookie(&http.Cookie{Name: "__Host-" + loginCSRFCookie, Value: csrf})
 	rec := httptest.NewRecorder()
 	a.srv.Handler().ServeHTTP(rec, req)
 	var sc *http.Cookie
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == sessionCookie {
+		if c.Name == "__Host-"+sessionCookie {
 			sc = c
 		}
 	}
@@ -273,14 +285,20 @@ func TestAnonymousAndTopics(t *testing.T) {
 	if g := f.Grants("*"); len(g) != 1 || g[0].Topic != "backup_nas" || g[0].Permission != "read-only" {
 		t.Fatalf("make public: %+v", g)
 	}
-	a.mustContain(r, "public read-only", "Also matched by", `href="#t-backup_`, `id="t-backup_*"`)
+	a.mustContain(r, `data-anon="read-only">anonymous: read-only</span>`, "Also matched by", `href="#t-backup_`, `id="t-backup_*"`)
 
 	r = a.get("/topics?view=matrix")
-	a.mustContain(r, "write-only", "Everyone (anonymous)")
+	a.mustContain(r, `<span class="perm perm-write-only" title="write-only">`, `<th><a href="/users/%2A">Everyone (anonymous)</a></th>`)
 
-	a.post("/topics/private", url.Values{"topic": {"backup_nas"}})
-	if g := f.Grants("*"); len(g) != 0 {
+	// "Make private" must deny anonymous access explicitly: removing the rule
+	// would fall back to auth-default-access, which may be public.
+	r = a.post("/topics/private", url.Values{"topic": {"backup_nas"}})
+	if g := f.Grants("*"); len(g) != 1 || g[0].Topic != "backup_nas" || g[0].Permission != "deny-all" {
 		t.Fatalf("make private: %+v", g)
+	}
+	nas := topicSection(t, r.Body, "backup_nas")
+	if !strings.Contains(nas, `data-anon="deny-all"`) || strings.Contains(nas, "Make private (deny anonymous)") {
+		t.Fatal("make private must not be offered again for a topic that already denies anonymous access")
 	}
 	a.post("/topics/revoke", url.Values{"topic": {"backup_*"}, "username": {"phil"}})
 	if g := f.Grants("phil"); len(g) != 1 || g[0].Topic != "backup_nas" {
@@ -322,7 +340,7 @@ func TestServiceAccountFlow(t *testing.T) {
 		"name": {"backup"}, "topic": {"backups"}, "permission": {"write-only"},
 		"label": {"nas script"}, "expiry": {"never"},
 	})
-	if r.Path != "/service-accounts/svc-backup" {
+	if !strings.HasPrefix(r.Path, "/service-accounts/svc-backup?reveal=") {
 		t.Fatalf("expected svc page, got %s\n%s", r.Path, r.Body)
 	}
 	tok := revealedToken(r.Body)
@@ -365,15 +383,20 @@ func TestServiceAccountFlow(t *testing.T) {
 	r = a.post("/service-accounts/svc-backup/tokens", url.Values{"expiry": {"custom"}, "expiry_date": {"2000-01-01"}})
 	a.mustContain(r, "must be in the future")
 
-	// Revoke the first token by index (as listed on the page).
-	a.get("/service-accounts/svc-backup")
-	a.post("/service-accounts/svc-backup/tokens/revoke", url.Values{"idx": {"0"}, "masked": {ntfyapi.MaskToken(tok)}})
+	// The list is sorted by expiry, never-expiring last: tok2 (30 days) first.
+	r = a.get("/service-accounts/svc-backup")
+	if strings.Index(r.Body, ntfyapi.MaskToken(tok2)) > strings.Index(r.Body, ntfyapi.MaskToken(tok)) {
+		t.Fatal("tokens must be sorted by expiry, never-expiring last")
+	}
+	// Revoke the never-expiring token by its index on the page.
+	idx := tokenIndex(t, r.Body, tok)
+	a.post("/service-accounts/svc-backup/tokens/revoke", url.Values{"idx": {idx}, "masked": {ntfyapi.MaskToken(tok)}})
 	toks = f.Tokens("svc-backup")
 	if len(toks) != 1 || toks[0].Token != tok2 {
 		t.Fatalf("revoke by index: %+v", toks)
 	}
-	// A stale form (index 0 now points at tok2) must not revoke the wrong token.
-	r = a.post("/service-accounts/svc-backup/tokens/revoke", url.Values{"idx": {"0"}, "masked": {ntfyapi.MaskToken(tok)}})
+	// A stale form (the index now points elsewhere or nowhere) must not revoke another token.
+	r = a.post("/service-accounts/svc-backup/tokens/revoke", url.Values{"idx": {idx}, "masked": {ntfyapi.MaskToken(tok)}})
 	a.mustContain(r, "Unknown token")
 	if len(f.Tokens("svc-backup")) != 1 {
 		t.Fatal("stale revoke must not delete another token")
@@ -488,7 +511,7 @@ func TestBasePath(t *testing.T) {
 
 func TestClientIP(t *testing.T) {
 	_, ipnet, _ := net.ParseCIDR("10.0.0.0/8")
-	s := &Server{cfg: Config{TrustedProxies: []*net.IPNet{ipnet}}}
+	s := &Server{cfg: Config{TrustedProxies: []*net.IPNet{ipnet}}, log: slog.New(slog.DiscardHandler)}
 	req := func(remote string, xff ...string) *http.Request {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = remote

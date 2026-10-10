@@ -17,13 +17,18 @@ services:
     restart: unless-stopped
     depends_on:
       - ntfy
+    # Leaves time to revoke the ntfy tokens of open sessions on shutdown.
+    stop_grace_period: 20s
     environment:
       NTFY_URL: "http://ntfy:80"                      # internal URL, required
       NTFY_PUBLIC_URL: "https://ntfy.example.com"     # shown in curl examples
+      # Behind a reverse proxy, set this to the proxy's address as ntfy-admin
+      # sees it (one IP or a narrow subnet, not all of 172.16.0.0/12).
+      # Without it, all clients share one login rate limit and one audit IP.
+      TRUSTED_PROXIES: ""
       # COOKIE_SECURE: "false"                        # only for plain-HTTP testing
       # SESSION_TTL: "12h"
       # SVC_PREFIX: "svc-"
-      # TRUSTED_PROXIES: "172.16.0.0/12"              # your reverse proxy
-      # BASE_PATH: "/admin"
+      # BASE_PATH: "/admin"                           # the proxy must NOT strip it
     ports:
       - "127.0.0.1:8080:8080"

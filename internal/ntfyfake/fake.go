@@ -1,9 +1,15 @@
 // Package ntfyfake is an in-memory fake of the ntfy admin/account HTTP API,
-// for tests. It follows the behaviour of ntfy's server_admin.go and
-// server_account.go closely enough to exercise ntfy-admin's error paths.
+// for tests. It follows the behaviour of ntfy v2.29.0 (server_admin.go,
+// server_account.go, user/manager.go) closely enough to exercise
+// ntfy-admin's error paths, including ntfy's quirks:
+//   - a per-client-IP limit on failed authentications (all requests to the
+//     fake come from one IP, as ntfy-admin's do);
+//   - excess tokens pruned by expiry, never-expiring tokens first;
+//   - HTTP 500 for unknown tokens and for changes to provisioned users.
 package ntfyfake
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -46,11 +52,21 @@ type Fake struct {
 	order    []string
 	failures map[string]failure // "METHOD /path" -> injected failure (one-shot)
 	Calls    []string           // "METHOD /path" of every request, for assertions
+
+	// Auth failure limiter, like ntfy's visitor-auth-failure-limit-burst
+	// (30) and -replenish (1m). Refill is disabled unless AuthRefill is set.
+	authTokens float64
+	AuthBurst  int
+	AuthRefill time.Duration
+	authLast   time.Time
+
+	misattribute string // next created token goes to this user instead
 }
 
 // New starts a fake with the anonymous user "*" and one admin.
 func New(adminName, adminPassword string) *Fake {
-	f := &Fake{users: map[string]*user{}, failures: map[string]failure{}}
+	f := &Fake{users: map[string]*user{}, failures: map[string]failure{}, AuthBurst: 30}
+	f.authTokens = float64(f.AuthBurst)
 	f.addUser(&user{name: ntfyapi.Everyone, role: ntfyapi.RoleAnonymous})
 	f.addUser(&user{name: adminName, password: adminPassword, role: ntfyapi.RoleAdmin, provisioned: true})
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -67,6 +83,37 @@ func (f *Fake) AddRegularUser(name, password string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addUser(&user{name: name, password: password, role: ntfyapi.RoleUser})
+}
+
+// AddProvisionedUser adds a regular user as if defined in server.yml auth-users.
+func (f *Fake) AddProvisionedUser(name, password string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addUser(&user{name: name, password: password, role: ntfyapi.RoleUser, provisioned: true})
+}
+
+// AddToken adds a token for a user directly (bypassing the API and pruning).
+func (f *Fake) AddToken(username string, t ntfyapi.Token) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u := f.users[username]
+	u.tokens = append(u.tokens, t)
+}
+
+// SetAuthBurst sets the number of failed authentications allowed before
+// ntfy answers 429 to all authenticated requests.
+func (f *Fake) SetAuthBurst(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.AuthBurst, f.authTokens = n, float64(n)
+}
+
+// MisattributeNextToken makes the next POST /v1/account/token create the
+// token for user `to`, simulating ntfy's per-IP visitor mix-up.
+func (f *Fake) MisattributeNextToken(to string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.misattribute = to
 }
 
 // AddProvisionedToken adds a token as if it came from server.yml auth-tokens.
@@ -146,6 +193,21 @@ func (f *Fake) CountCalls(call string) int {
 	return n
 }
 
+// authAllowed refills and checks the auth failure bucket.
+func (f *Fake) authAllowed() bool {
+	if f.AuthRefill > 0 {
+		now := time.Now()
+		if !f.authLast.IsZero() {
+			f.authTokens += float64(now.Sub(f.authLast)) / float64(f.AuthRefill)
+		}
+		f.authLast = now
+		if f.authTokens > float64(f.AuthBurst) {
+			f.authTokens = float64(f.AuthBurst)
+		}
+	}
+	return f.authTokens >= 1
+}
+
 func writeErr(w http.ResponseWriter, status, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -207,8 +269,14 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"healthy": true})
 		return
 	}
+	hasAuth := r.Header.Get("Authorization") != ""
+	if hasAuth && !f.authAllowed() {
+		writeErr(w, 429, 42909, "limit reached: too many auth failures")
+		return
+	}
 	u, ok := f.authenticate(r)
 	if !ok {
+		f.authTokens--
 		writeErr(w, 401, 40101, "unauthorized")
 		return
 	}
@@ -219,6 +287,8 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.serveAdmin(w, r, key)
+	case key == "GET /v1/account" && u == nil:
+		writeJSON(w, ntfyapi.Account{Username: ntfyapi.Everyone, Role: ntfyapi.RoleAnonymous})
 	case strings.HasPrefix(r.URL.Path, "/v1/account"):
 		if u == nil {
 			writeErr(w, 401, 40101, "unauthorized")
@@ -282,6 +352,8 @@ func (f *Fake) serveAdmin(w http.ResponseWriter, r *http.Request, key string) {
 			writeErr(w, 400, 40001, "invalid request: need to provide at least one of \"password\", \"password_hash\" or \"tier\"")
 		} else if target != nil && target.role == ntfyapi.RoleAdmin {
 			writeErr(w, 403, 40301, "forbidden")
+		} else if target != nil && target.provisioned {
+			writeErr(w, 500, 50001, "internal server error")
 		} else {
 			if target == nil {
 				target = &user{name: b.Username, role: ntfyapi.RoleUser}
@@ -300,6 +372,8 @@ func (f *Fake) serveAdmin(w http.ResponseWriter, r *http.Request, key string) {
 			writeErr(w, 400, 40019, "invalid request: user not found")
 		} else if target.role != ntfyapi.RoleUser {
 			writeErr(w, 401, 40101, "unauthorized: can only remove regular users from API")
+		} else if target.provisioned {
+			writeErr(w, 500, 50001, "internal server error")
 		} else {
 			delete(f.users, b.Username)
 			f.order = slices.DeleteFunc(f.order, func(n string) bool { return n == b.Username })
@@ -307,7 +381,7 @@ func (f *Fake) serveAdmin(w http.ResponseWriter, r *http.Request, key string) {
 		}
 	case "PUT /v1/users/access", "POST /v1/users/access":
 		if target == nil {
-			writeErr(w, 400, 40019, "invalid request: user not found")
+			writeErr(w, 400, 40031, "invalid request: user does not exist")
 		} else if !ntfyapi.ValidPermission(b.Permission) {
 			writeErr(w, 400, 40025, "invalid request: invalid permission")
 		} else if !ntfyapi.ValidTopicPattern(b.Topic) {
@@ -355,9 +429,20 @@ func (f *Fake) serveAccount(w http.ResponseWriter, r *http.Request, key string, 
 		if b.Label != nil {
 			t.Label = *b.Label
 		}
-		u.tokens = append(u.tokens, t)
-		if len(u.tokens) > maxTokens {
-			u.tokens = u.tokens[len(u.tokens)-maxTokens:]
+		owner := u
+		if f.misattribute != "" {
+			owner, f.misattribute = f.users[f.misattribute], ""
+		}
+		owner.tokens = append(owner.tokens, t)
+		if len(owner.tokens) > maxTokens {
+			// ntfy keeps the tokens with the highest expiry ("ORDER BY expires
+			// DESC"), so never-expiring tokens (0) are deleted first.
+			keep := slices.Clone(owner.tokens)
+			slices.SortStableFunc(keep, func(a, b ntfyapi.Token) int { return cmp.Compare(b.Expires, a.Expires) })
+			keep = keep[:maxTokens]
+			owner.tokens = slices.DeleteFunc(owner.tokens, func(t ntfyapi.Token) bool {
+				return !slices.ContainsFunc(keep, func(k ntfyapi.Token) bool { return k.Token == t.Token })
+			})
 		}
 		writeJSON(w, t)
 	case "DELETE /v1/account/token":
@@ -367,13 +452,15 @@ func (f *Fake) serveAccount(w http.ResponseWriter, r *http.Request, key string, 
 			return
 		}
 		i := slices.IndexFunc(u.tokens, func(t ntfyapi.Token) bool { return t.Token == tok })
-		if i >= 0 && u.tokens[i].Provisioned {
+		if i < 0 {
+			writeErr(w, 500, 50001, "internal server error") // ntfy's answer for unknown tokens
+			return
+		}
+		if u.tokens[i].Provisioned {
 			writeErr(w, 409, 40903, "conflict: cannot change or delete provisioned token")
 			return
 		}
-		if i >= 0 {
-			u.tokens = slices.Delete(u.tokens, i, i+1)
-		}
+		u.tokens = slices.Delete(u.tokens, i, i+1)
 		success(w)
 	default:
 		writeErr(w, 404, 40401, fmt.Sprintf("page not found: %s", key))

@@ -277,3 +277,7 @@ Small additions to ntfy (`server/server_admin.go`) would remove the workarounds:
 - A fix for the per-IP visitor race: users without a tier share one visitor object per
   client IP, and handlers read the user from it (`v.User()`), so concurrent requests from
   one IP with different credentials can be attributed to the wrong user.
+
+## License
+
+[MIT](LICENSE)
